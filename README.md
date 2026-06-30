@@ -100,12 +100,30 @@ GITHUB_PERSONAL_ACCESS_TOKEN=your_github_pat_token
 STITCH_API_KEY=your_stitch_api_key_here
 ```
 
-### Step 3: Activate and Use the CLI
+### Step 3: Activate and Register the CLI
 Activate your virtual environment:
 ```bash
 source .venv/bin/activate
 ```
-The **`devAIteam`** command is now fully registered in your shell!
+
+Then register the `devAIteam` console command by installing the project itself
+(this creates `.venv/bin/devAIteam`):
+```bash
+uv pip install -e .
+```
+The **`devAIteam`** command is now available whenever the virtual environment is active.
+
+> **No install?** You can always run the bundled wrapper from the repo root without
+> installing — `./devAIteam list` — or invoke the module directly:
+> `python main.py list`.
+
+> **LLM backend.** Configure your provider in `.env` (copy from `env.example`):
+> set `LLM_PROVIDER=openai` (requires `OPENAI_API_KEY`) or `LLM_PROVIDER=mlx`
+> for the local server. If unset, it uses cloud when `OPENAI_API_KEY` is present,
+> otherwise the local MLX endpoint at `http://localhost:8000/v1`.
+
+> **Tip.** Run `devAIteam doctor` first to verify your LLM backend and MCP
+> servers (these require `npx` on your PATH) are reachable before a full run.
 
 ---
 
