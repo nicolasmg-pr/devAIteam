@@ -1,3 +1,4 @@
+import sys
 import traceback
 from typing import Optional
 from langgraph.graph import StateGraph, START, END
@@ -73,6 +74,10 @@ def format_node(state: DevOpsState) -> dict:
 
 def human_preview_node(state: DevOpsState) -> dict:
     """Standard Python input() blocking prompt (not a LangGraph interrupt)."""
+    # Skip the blocking prompt in non-interactive environments (e.g. CI, pipes).
+    if not sys.stdin.isatty():
+        print("\n⏩ Non-interactive session: continuing automatically.")
+        return {}
     # Wait for the user to press ENTER
     try:
         input("\n⏸  Press ENTER when you have tested the app to continue...")

@@ -6,10 +6,15 @@ Flow: START → test_generator_node + code_reviewer_node (parallel) → merge_no
 from __future__ import annotations
 
 import traceback
-from typing import Optional
+from typing import Optional, Annotated
 
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
+
+
+def _keep_first(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """Reducer: keep the first non-None error from concurrent fan-out branches."""
+    return a or b
 
 from agents.pm_agent import PMOutput
 from agents.developer_agent import DeveloperOutput
@@ -46,7 +51,9 @@ class QAState(BaseModel):
     test_saved: bool = Field(
         default=False, description="Whether test files were successfully saved"
     )
-    error: Optional[str] = Field(default=None, description="Error message if any")
+    error: Annotated[Optional[str], _keep_first] = Field(
+        default=None, description="Error message if any"
+    )
 
 
 # ── Nodes ────────────────────────────────────────────────────────────────────
@@ -205,9 +212,22 @@ def format_node(state: QAState) -> dict:
         print("🎭 E2E TESTS / VERIFICATION RESULTS:")
         print(f"{'─' * 60}")
         for url, res in state.e2e_output.items():
-            status_icon = "✅" if res.get("status") in ["success", "simulated"] else "❌"
-            print(f"   {status_icon} {url} : Status={res.get('status')}")
-            if "http_code" in res:
+            if not isinstance(res, dict):
+                print(f"   ❌ {url} : {res}")
+                continue
+            status = res.get("status")
+            if status == "server_offline":
+                status_icon = "⚠️"
+                status_text = "offline (skipped - server not running yet)"
+            elif status in ["success", "simulated"]:
+                status_icon = "✅"
+                status_text = status
+            else:
+                status_icon = "❌"
+                status_text = f"failed ({status})"
+                
+            print(f"   {status_icon} {url} : Status={status_text}")
+            if status != "server_offline" and "http_code" in res:
                 print(f"      HTTP Code: {res.get('http_code')}")
             if "screenshot_path" in res:
                 print(f"      Visual Capture: {res.get('screenshot_path')}")

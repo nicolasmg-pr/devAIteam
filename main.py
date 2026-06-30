@@ -19,7 +19,7 @@ from graphs.architect_graph import architect_graph
 from graphs.ui_designer_graph import ui_designer_graph
 from graphs.developer_graph import developer_graph
 from graphs.qa_graph import qa_graph
-from graphs.reviewer_graph import reviewer_graph, reviewer_config
+from graphs.reviewer_graph import reviewer_graph, make_reviewer_config
 from graphs.devops_graph import devops_graph
 
 from langgraph.types import Command
@@ -145,6 +145,10 @@ def main() -> None:
         print("❌ Developer Agent failed. Aborting pipeline.")
         return
 
+    if dev_result.get("developer_output") is None:
+        print("❌ Developer Agent produced no output. Aborting pipeline.")
+        return
+
     # ── Stage 4: QA Agent (tests + code review in parallel) ──────────
     print("\n🧪 Running QA Agent (tests + code review in parallel)...")
     qa_result = qa_graph.invoke({
@@ -158,17 +162,31 @@ def main() -> None:
 
     # ── Stage 5: Reviewer Agent (Human-in-the-loop) ──────────────────
     print("\n👁  Running Code Reviewer (with human-in-the-loop)...")
-    
+
+    # Fresh checkpoint thread for this run; reused across all resume invokes below.
+    reviewer_config = make_reviewer_config()
+
     # Initialize state
     initial_state = {
         "developer_output": dev_result["developer_output"],
         "qa_output": qa_result["qa_output"]
     }
-    
+
     rev_result = reviewer_graph.invoke(initial_state, reviewer_config)
-    
-    # Loop for human-in-the-loop interruption
+
+    # Loop for human-in-the-loop interruption, with an explicit iteration cap.
+    MAX_HITL_ITERATIONS = 10
+    hitl_iterations = 0
     while rev_result and not rev_result.get("final_output"):
+        if hitl_iterations >= MAX_HITL_ITERATIONS:
+            print("⚠️  Reached maximum human-in-the-loop iterations. Finalizing automatically.")
+            rev_result = reviewer_graph.invoke(
+                Command(resume="a Auto-approved (max iterations reached)"),
+                reviewer_config,
+            )
+            break
+        hitl_iterations += 1
+
         print("┌─────────────────────────────────────────┐")
         print("│  Do you approve this review?            │")
         print("│  [a] Approve                            │")
@@ -178,17 +196,26 @@ def main() -> None:
         print("└─────────────────────────────────────────┘")
         try:
             user_input = input("Enter your option and optional feedback: ")
-        except EOFError:
-            # Handle non-interactive environments gracefully
-            user_input = "a Automatically approved (EOF)"
-            
+        except (EOFError, KeyboardInterrupt):
+            # Non-interactive / EOF: treat as a single terminal approve, then stop.
+            print("\n⏩ Non-interactive input: auto-approving and finalizing.")
+            rev_result = reviewer_graph.invoke(
+                Command(resume="a Automatically approved (EOF)"),
+                reviewer_config,
+            )
+            break
+
         rev_result = reviewer_graph.invoke(Command(resume=user_input), reviewer_config)
     
     # ── Stage 6: DevOps Agent (Local Preview) ────────────────────────
     print("\n🚀 Running DevOps Agent — spinning up local preview...")
-    
-    proj_name = dev_result["developer_output"].project_name.lower().replace(" ", "-").replace("_", "-")
-    
+
+    dev_output_obj = dev_result.get("developer_output")
+    if dev_output_obj is None:
+        print("❌ No developer output available for DevOps stage. Aborting pipeline.")
+        return
+    proj_name = dev_output_obj.project_name.lower().replace(" ", "-").replace("_", "-")
+
     initial_devops_state = {
         "developer_output": dev_result["developer_output"],
         "project_name": proj_name
@@ -235,7 +262,7 @@ def main() -> None:
         
         size_mb = get_output_size_mb(proj_name)
         preview_ready = local_preview_output.preview_ready if local_preview_output else False
-        pr_url = rev_result.get("github_output", {}).get("pr_url") if rev_result else None
+        pr_url = (rev_result.get("github_output") or {}).get("pr_url") if rev_result else None
         
         meta = ProjectMeta(
             project_name=proj_name,
@@ -267,18 +294,28 @@ def main() -> None:
     qa_playwright_mcp = "Simulated (aiohttp Fallback)"
     e2e_out = qa_result.get("e2e_output")
     if e2e_out:
-        if any(res.get("status") == "success" for res in e2e_out.values()):
+        if any(
+            isinstance(res, dict) and res.get("status") == "success"
+            for res in e2e_out.values()
+        ):
             qa_playwright_mcp = "Real MCP (Playwright)"
-            
+
     qa_fs_mcp = "Real MCP (Filesystem)" if qa_result.get("test_saved") else "Simulated (Local Fallback)"
-    
+
     rev_github_mcp = "Simulated (Local/Fallback)"
-    gh_out = rev_result.get("github_output")
-    if gh_out and gh_out.get("status") == "success":
+    gh_out = (rev_result.get("github_output") or {}) if rev_result else {}
+    if gh_out.get("status") == "success":
         rev_github_mcp = f"Real MCP (GitHub PR: {gh_out.get('pr_url')})"
 
+    # Overall success: reviewer finalized and developer output present.
+    pipeline_ok = bool(rev_out) and dev_out is not None
+    if pipeline_ok:
+        banner_title = "║                        FULL PIPELINE STATUS ✅                           ║"
+    else:
+        banner_title = "║                     PARTIAL PIPELINE STATUS ⚠️                            ║"
+
     print("\n╔══════════════════════════════════════════════════════════════════════════╗")
-    print("║                        FULL PIPELINE STATUS ✅                           ║")
+    print(banner_title)
     print("╠══════════════════════════════════════════════════════════════════════════╣")
     print(f"║ 📋 PM Agent:       {str(n_stories).ljust(2)} user stories.                                        ║")
     print(f"║ 🏗️  Architect:      {str(n_endpoints).ljust(2)} endpoints, {str(n_entities).ljust(2)} database entities.                   ║")
@@ -302,37 +339,54 @@ def main() -> None:
     print("╚══════════════════════════════════════════════════════════════════════════╝\n")
 
     # ── Memory Cleanup Prompts ─────────────────────────────────────────
+    interactive = sys.stdin.isatty()
+
     # A. Clean Docker VM RAM
     if local_preview_output and local_preview_output.preview_ready:
         print("💡 [Memory Cleanup]")
         print("   The local preview containers are currently running, consuming ~4GB in the Docker VM.")
+        if not interactive:
+            print("   ⏩ Non-interactive session: leaving Docker containers running.")
+        else:
+            try:
+                cleanup_docker = input("❓ Do you want to stop the local preview Docker containers to free up RAM? [y/N]: ").strip().lower()
+                if cleanup_docker in ["y", "yes"]:
+                    import shutil
+                    import subprocess
+                    # Pick an available docker CLI up front; skip if neither exists.
+                    if shutil.which("docker"):
+                        cmd = ["docker", "compose", "down"]
+                    elif shutil.which("docker-compose"):
+                        cmd = ["docker-compose", "down"]
+                    else:
+                        cmd = None
+                        print("⚠️ [Cleanup] Neither 'docker' nor 'docker-compose' found; skipping container teardown.")
+                    if cmd is not None:
+                        print(f"⚙️ [Cleanup] Stopping Docker containers for project '{proj_name}'...")
+                        result = subprocess.run(cmd, cwd=f"./output/{proj_name}", capture_output=True)
+                        if result.returncode == 0:
+                            print("✅ [Cleanup] Docker preview containers successfully stopped. RAM reclaimed!")
+                        else:
+                            err = result.stderr.decode(errors="replace").strip() if result.stderr else ""
+                            print(f"⚠️ [Cleanup] Failed to stop Docker containers (exit {result.returncode}). {err}")
+            except (KeyboardInterrupt, EOFError):
+                pass
+
+    # B. Clean Python RAM from MLX local server
+    if interactive:
         try:
-            cleanup_docker = input("❓ Do you want to stop the local preview Docker containers to free up RAM? [y/N]: ").strip().lower()
-            if cleanup_docker in ["y", "yes"]:
-                import shutil
-                import subprocess
-                print(f"⚙️ [Cleanup] Stopping Docker containers for project '{proj_name}'...")
-                cmd = ["docker", "compose", "down"]
-                if not shutil.which("docker"):
-                    cmd = ["docker-compose", "down"]
-                subprocess.run(cmd, cwd=f"./output/{proj_name}", capture_output=True)
-                print("✅ [Cleanup] Docker preview containers successfully stopped. RAM reclaimed!")
+            cleanup_mlx = input("❓ Do you want to stop the local MLX server to reclaim 20GB of Python memory? [y/N]: ").strip().lower()
+            if cleanup_mlx in ["y", "yes"]:
+                from deploy.clean_runner import kill_mlx_server
+                kill_mlx_server()
         except (KeyboardInterrupt, EOFError):
             pass
-            
-    # B. Clean Python RAM from MLX local server
-    try:
-        cleanup_mlx = input("❓ Do you want to stop the local MLX server to reclaim 20GB of Python memory? [y/N]: ").strip().lower()
-        if cleanup_mlx in ["y", "yes"]:
-            from deploy.clean_runner import kill_mlx_server
-            kill_mlx_server()
-    except (KeyboardInterrupt, EOFError):
-        pass
+    else:
+        print("⏩ Non-interactive session: leaving local MLX server running.")
 
-    # C. Instantly kill this python process to free 100% of memory and dangling threads
-    import os
+    # C. Exit cleanly to free memory and dangling threads.
     print("👋 Exiting cleanly...")
-    os._exit(0)
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

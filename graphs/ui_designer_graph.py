@@ -19,8 +19,14 @@ def ui_designer_node(state: UIDesignerState) -> dict:
     stitch_api_key = os.environ.get("STITCH_API_KEY")
     if not stitch_api_key:
         print("⚠️  [UI Designer] STITCH_API_KEY was not found in the environment variables.")
-    output = run_ui_designer_agent(state["architect_output"], stitch_api_key)
-    return {"ui_designer_output": output}
+    try:
+        output = run_ui_designer_agent(state["architect_output"], stitch_api_key)
+        return {"ui_designer_output": output}
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        print(f"⚠️  [UI Designer] Agent failed: {exc}. Continuing without UI.")
+        return {"ui_designer_output": None}
 
 # ── Graph Construction ─────────────────────────────────────────────────────────
 

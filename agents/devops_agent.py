@@ -7,6 +7,7 @@ import webbrowser
 from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
 from config.llm_config import llm_developer
+from config.paths import PROJECT_ROOT
 from langchain_core.messages import HumanMessage, SystemMessage
 from agents.developer_agent import DeveloperOutput
 
@@ -57,6 +58,7 @@ The docker-compose.yml file must configure:
 1. A PostgreSQL database (with postgres/postgres credentials).
 2. A NestJS backend service exposed on port 3000 (building from a Dockerfile or using a node image with volume/setup).
 3. A Flutter frontend service compiled for web exposed on port 8080 using Nginx.
+4. IMPORTANT: Ensure that any volume mounting for the backend service maps to '/app' (not '/usr/src/app'), to match the backend's Dockerfile working directory.
 
 Your response must ONLY be the valid YAML code for the docker-compose.yml file.
 Do NOT include explanations, do NOT include markdown, do NOT use backticks, only the pure YAML content.
@@ -167,7 +169,7 @@ async def run_local_preview(developer_output: DeveloperOutput, project_name: str
         if not os.path.exists(be_dockerfile):
             try:
                 with open(be_dockerfile, "w", encoding="utf-8") as f:
-                    f.write("FROM node:18-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\nRUN npm run build\nEXPOSE 3000\nCMD [\"npm\", \"run\", \"start:prod\"]\n")
+                    f.write("FROM node:18-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\nRUN npm run build\nEXPOSE 3000\nCMD [\"npm\", \"start\"]\n")
             except Exception as e:
                 print(f"   ⚠️  [DevOps] Could not write backend Dockerfile: {e}")
                 
@@ -257,13 +259,12 @@ async def run_local_preview(developer_output: DeveloperOutput, project_name: str
         # and start the process.
         # However, to be fully robust and prevent blocking if code doesn't build, we can launch Popen
         try:
-            # Check if package.json exists in root or output
-            pkg_path = "./package.json"
-            cwd = "/Users/nikomendez/Documents/SWdevAIgency_project"
+            # Prefer the generated project's own dir; fall back to the repo root.
+            pkg_path = os.path.join(out_dir, "package.json")
+            cwd = out_dir
             if not os.path.exists(pkg_path):
-                # Try in out_dir
-                pkg_path = os.path.join(out_dir, "package.json")
-                cwd = out_dir
+                cwd = str(PROJECT_ROOT)
+                pkg_path = os.path.join(cwd, "package.json")
                 
             print(f"   🚀 [DevOps] npm install && npm run start:dev in {cwd}...")
             # We don't want to block the thread forever, so run npm run start in background

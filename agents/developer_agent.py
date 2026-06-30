@@ -3,17 +3,28 @@ real, functional code based on the Architect's output."""
 
 from __future__ import annotations
 
-import json
+import asyncio
+import os
 import re
-from typing import Optional
+import shlex
+from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 from config.llm_config import llm_developer
-from tools.llm_helpers import clean_llm_response
+from config.paths import (
+    PROJECT_ROOT,
+    ensure_output_dir,
+    project_dir,
+    safe_join,
+    UnsafePathError,
+)
+from tools.llm_helpers import parse_llm_json
 
 from agents.architect_agent import ArchitectOutput
-from typing import Optional, Any
+from agents.mcp_client import ThreadSafeMCPClient
+from agents.ui_designer_agent import UIDesignerOutput
 
 
 # ── Pydantic output models ──────────────────────────────────────────────────
@@ -171,71 +182,79 @@ Regenerate the complete response:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _clean_response(text: str) -> str:
-    """Strip markdown code fences and surrounding whitespace."""
-    cleaned = re.sub(r"```(?:json)?\s*", "", text)
-    cleaned = re.sub(r"```", "", cleaned)
-    return cleaned.strip()
+def _parse_json_robust(text: str) -> Any:
+    """Parse JSON (with json-repair fallback) and unwrap list-wrapped dicts."""
+    data = parse_llm_json(text)
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        data = data[0]
+    return data
 
 
-def _fix_json(text: str) -> str:
-    """Fix common LLM JSON errors: trailing commas before ] or }."""
-    fixed = re.sub(r",\s*([}\]])", r"\1", text)
-    return fixed
+def _final_ai_text(messages_list: list) -> str:
+    """Return the content of the last AI message, guarding against a trailing
+    tool message being mistaken for the JSON answer. Returns "" if none found."""
+    for msg in reversed(messages_list):
+        if getattr(msg, "type", None) == "ai" and msg.content:
+            return msg.content
+    if messages_list:
+        last_msg = messages_list[-1]
+        if getattr(last_msg, "type", None) == "ai":
+            return last_msg.content or ""
+    return ""
 
 
-def _parse_json_robust(text: str) -> dict:
-    """Parse JSON with fallback to json_repair for malformed LLM output."""
-    from json_repair import loads as repair_loads
+def _clean_readme(text: str) -> str:
+    """Clean README markdown from the LLM.
 
-    try:
-        return json.loads(text, strict=False)
-    except json.JSONDecodeError:
-        return repair_loads(text)
-
-
-def _invoke_with_retry(llm: Any, messages: list, model_class: type, max_retries: int = 2):
-    """Invoke the LLM, parse JSON, and retry with a stricter prompt on failure."""
-    last_error = None
-    for attempt in range(1 + max_retries):
-        response = llm.invoke(messages)
-        raw_text: str = response.content  # type: ignore[assignment]
-        cleaned = clean_llm_response(raw_text)
-
-        try:
-            data = _parse_json_robust(cleaned)
-            return model_class.model_validate(data)
-        except Exception as exc:
-            last_error = exc
-            print(f"   ⚠️  Attempt {attempt + 1} failed: {exc}")
-            if attempt < max_retries:
-                print(f"   🔄 Retrying with stricter prompt...")
-                messages = messages + [
-                    HumanMessage(content=RETRY_PROMPT.format(error=str(exc)))
-                ]
-
-    raise last_error  # type: ignore[misc]
+    Unlike ``clean_llm_response`` (which extracts a JSON value and would mangle
+    markdown containing braces), this only removes ``<think>`` reasoning blocks and
+    a single outer ```` ``` ```` fence if the whole body is wrapped in one.
+    """
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-import os
-from langgraph.prebuilt import create_react_agent
-from agents.mcp_client import ThreadSafeMCPClient
-import json_repair
+# Setup commands we are willing to auto-execute. Each entry is the exact argv
+# prefix (after shlex.split) that a command must start with. Anything else is
+# skipped. Commands are run via create_subprocess_exec (no shell) so there is no
+# shell interpretation of metacharacters.
+_SAFE_SETUP_COMMANDS: tuple[tuple[str, ...], ...] = (
+    ("npm", "install"),
+    ("npm", "ci"),
+    ("yarn", "install"),
+    ("pnpm", "install"),
+    ("flutter", "pub", "get"),
+    ("pip", "install", "-r", "requirements.txt"),
+)
 
-from agents.ui_designer_agent import UIDesignerOutput
-import asyncio
-import threading
-import queue
+# Shell metacharacters that must never appear in an auto-executed command's argv.
+_SHELL_METACHARS = set(";&|<>`$(){}!*?\n\r")
 
-def _write_generated_files(files: list[CodeFile]):
-    """Auto-save generated code files to the project directory."""
-    base_dir = "/Users/nikomendez/Documents/SWdevAIgency_project"
+
+def _write_generated_files(files: list[CodeFile], project_name: str):
+    """Auto-save generated code files under the project's output directory.
+
+    Each path is built from LLM-supplied components via :func:`safe_join`, so a
+    malicious ``path``/``filename`` cannot escape the project sandbox. Files are
+    NEVER written into the platform repo root.
+    """
+    project_root = project_dir(project_name)
     for f in files:
-        target_dir = os.path.join(base_dir, f.path)
-        os.makedirs(target_dir, exist_ok=True)
-        file_path = os.path.join(target_dir, f.filename)
+        try:
+            file_path = safe_join(project_root, f.path, f.filename)
+        except UnsafePathError as ue:
+            print(f"⚠️ Skipping file with unsafe path {f.path}/{f.filename}: {ue}")
+            continue
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"💾 Saving file: {file_path}")
         with open(file_path, "w", encoding="utf-8") as out:
             out.write(f.content)
@@ -244,18 +263,20 @@ def _write_generated_files(files: list[CodeFile]):
 async def save_files_to_filesystem(developer_output: DeveloperOutput, architect_output: Optional[ArchitectOutput] = None):
     """Save backend and frontend generated files to the filesystem using MCP or fallback to python, and auto-generate a professional project README.md."""
     from agents.mcp_client import get_mcp_tools, FILESYSTEM_MCP_CONFIG
-    
+
     # 1. Connect to Filesystem MCP
-    tools = get_mcp_tools(FILESYSTEM_MCP_CONFIG, "stdio")
+    tools, mcp_client = get_mcp_tools(FILESYSTEM_MCP_CONFIG, "stdio", return_client=True)
     tool_map = {t.name: t for t in tools} if tools else {}
-    
-    output_dir = "./output"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    project_clean = developer_output.project_name.lower().replace(" ", "-").replace("_", "-")
-    project_output_dir = os.path.join(output_dir, project_clean)
-    os.makedirs(project_output_dir, exist_ok=True)
-    
+
+    ensure_output_dir()
+
+    # Slugify the project name into a safe slug and resolve a validated, sandboxed
+    # project output directory under OUTPUT_DIR.
+    raw_slug = developer_output.project_name.lower().replace(" ", "-").replace("_", "-")
+    project_clean = re.sub(r"[^a-z0-9-]", "", raw_slug).strip("-") or "project"
+    project_output_dir = project_dir(project_clean)
+    project_output_dir.mkdir(parents=True, exist_ok=True)
+
     # ── Auto-Generate Project README.md ───────────────────────────────────────
     readme_content = ""
     try:
@@ -359,11 +380,11 @@ async def save_files_to_filesystem(developer_output: DeveloperOutput, architect_
         
         print("📝 Generating project README.md using Technical Writer LLM...")
         res = llm_developer.invoke(messages)
-        readme_content = res.content.strip()
+        readme_content = _clean_readme(res.content)
     except Exception as exc:
         print(f"⚠️ Error generating README markdown via LLM: {exc}")
         readme_content = f"# {developer_output.project_name}\n\nAuto-generated project using devAIteam."
-        
+
     all_files = []
     if developer_output.backend and developer_output.backend.files:
         all_files.extend(developer_output.backend.files)
@@ -371,122 +392,126 @@ async def save_files_to_filesystem(developer_output: DeveloperOutput, architect_
         all_files.extend(developer_output.frontend.files)
         
     mcp_available = "write_file" in tool_map
-    
-    for f in all_files:
-        rel_path = os.path.join(f.path, f.filename)
-        
-        if mcp_available:
-            try:
-                full_path = os.path.join("/Users/nikomendez/Documents/SWdevAIgency_project", rel_path)
-                parent_dir = os.path.dirname(full_path)
-                os.makedirs(parent_dir, exist_ok=True)
-                
-                print(f"🚀 [Filesystem MCP] Saving file: {rel_path}...")
-                tool_map["write_file"].invoke({
-                    "path": full_path,
-                    "content": f.content
-                })
-                print(f"📄 Saved: {f.path}/{f.filename}")
-                continue
-            except Exception as e:
-                print(f"⚠️ [Filesystem MCP] Error writing {rel_path} via MCP: {e}. Using local fallback...")
-        
-        # Fallback to python
-        try:
-            fallback_full_path = os.path.join(project_output_dir, rel_path)
-            parent_dir = os.path.dirname(fallback_full_path)
-            os.makedirs(parent_dir, exist_ok=True)
-            with open(fallback_full_path, "w", encoding="utf-8") as out_f:
-                out_f.write(f.content)
-            print(f"📄 Saved (Local Fallback): {f.path}/{f.filename}")
-        except Exception as e:
-            print(f"❌ Error writing local fallback file: {e}")
 
-    # ── Write Project README.md to appropriate paths ──────────────────────────
-    if readme_content:
-        # A. Save under './output/{project_clean}/README.md' for isolation
-        readme_output_path = os.path.join(project_output_dir, "README.md")
-        try:
-            with open(readme_output_path, "w", encoding="utf-8") as rf:
-                rf.write(readme_content)
-            print(f"📄 Generated project README saved to: {readme_output_path}")
-        except Exception as e:
-            print(f"❌ Error writing project output README: {e}")
-            
-        # B. Save to workspace root '/Users/nikomendez/Documents/SWdevAIgency_project/README_PROJECT.md' 
-        # to avoid overwriting devAIteam platform's own README.md in the root.
-        # But wait! If the platform's README is clean or the user wants it at README.md,
-        # let's check if the root README is the platform README (contains "# devAIteam").
-        # If it DOES NOT contain "# devAIteam", we can safely save it as README.md in root!
-        # If it DOES contain "# devAIteam", we save it as README_PROJECT.md and tell the user!
-        # This is incredibly safe and smart.
-        root_readme_path = "/Users/nikomendez/Documents/SWdevAIgency_project/README.md"
-        is_platform_readme = False
-        if os.path.exists(root_readme_path):
-            try:
-                with open(root_readme_path, "r", encoding="utf-8") as rf:
-                    header = rf.read(200)
-                    if "# devAIteam" in header:
-                        is_platform_readme = True
-            except Exception:
-                pass
-                
-        target_root_readme = root_readme_path if not is_platform_readme else "/Users/nikomendez/Documents/SWdevAIgency_project/README_PROJECT.md"
-        
-        if mcp_available:
-            try:
-                print(f"🚀 [Filesystem MCP] Saving README to: {os.path.basename(target_root_readme)}...")
-                tool_map["write_file"].invoke({
-                    "path": target_root_readme,
-                    "content": readme_content
-                })
-                print(f"📄 Saved project README in workspace as: {os.path.basename(target_root_readme)}")
-            except Exception as e:
-                print(f"⚠️ [Filesystem MCP] Error writing workspace README: {e}. Using local fallback...")
-        else:
-            try:
-                with open(target_root_readme, "w", encoding="utf-8") as rf:
-                    rf.write(readme_content)
-                print(f"📄 Saved project README (Local Fallback) in workspace as: {os.path.basename(target_root_readme)}")
-            except Exception as e:
-                print(f"❌ Error writing workspace fallback README: {e}")
-
-    # ── Safe Setup Command Execution ─────────────────────────────────────────
     try:
-        base_dir = "/Users/nikomendez/Documents/SWdevAIgency_project"
-        safe_commands = []
-        all_cmds = []
-        if developer_output.backend and developer_output.backend.setup_commands:
-            all_cmds.extend(developer_output.backend.setup_commands)
-        if developer_output.frontend and developer_output.frontend.setup_commands:
-            all_cmds.extend(developer_output.frontend.setup_commands)
-            
-        for cmd in all_cmds:
-            cmd_lower = cmd.lower().strip()
-            # Whitelist safe dependencies installation and client generation commands
-            if any(k in cmd_lower for k in ["install", "pub get", "generate", "ci", "build"]):
-                # Exclude interactive/blocking server/migration commands to prevent hangs
-                if not any(b in cmd_lower for b in ["start", "run", "watch", "migrate"]):
-                    safe_commands.append(cmd)
-                    
-        if safe_commands:
-            print(f"\n📦 [Setup] Detected {len(safe_commands)} safe setup commands to automatically execute...")
-            for cmd in safe_commands:
-                print(f"⚙️ [Setup] Running: {cmd} ...")
-                proc = await asyncio.create_subprocess_shell(
-                    cmd,
-                    cwd=base_dir,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    print(f"✅ [Setup] Successfully completed: {cmd}")
-                else:
-                    err_msg = stderr.decode().strip() or stdout.decode().strip()
-                    print(f"⚠️ [Setup] '{cmd}' finished or warned: {err_msg[:200]}")
-    except Exception as exc:
-        print(f"⚠️ [Setup] Error executing safe setup commands: {exc}")
+        for f in all_files:
+            # Build the destination via safe_join so an LLM-supplied path/filename
+            # can never escape this project's output directory (and never lands in
+            # PROJECT_ROOT itself).
+            try:
+                dest_path = safe_join(project_output_dir, f.path, f.filename)
+            except UnsafePathError as ue:
+                print(f"⚠️ Skipping file with unsafe path {f.path}/{f.filename}: {ue}")
+                continue
+
+            rel_path = os.path.join(f.path, f.filename)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if mcp_available:
+                try:
+                    print(f"🚀 [Filesystem MCP] Saving file: {rel_path}...")
+                    tool_map["write_file"].invoke({
+                        "path": str(dest_path),
+                        "content": f.content
+                    })
+                    print(f"📄 Saved: {rel_path}")
+                    continue
+                except Exception as e:
+                    print(f"⚠️ [Filesystem MCP] Error writing {rel_path} via MCP: {e}. Using local fallback...")
+
+            # Fallback to python
+            try:
+                with open(dest_path, "w", encoding="utf-8") as out_f:
+                    out_f.write(f.content)
+                print(f"📄 Saved (Local Fallback): {rel_path}")
+            except Exception as e:
+                print(f"❌ Error writing local fallback file: {e}")
+
+        # ── Write Project README.md under the project's own output dir only ────
+        if readme_content:
+            readme_output_path = project_output_dir / "README.md"
+            if mcp_available:
+                try:
+                    print(f"🚀 [Filesystem MCP] Saving project README to: {readme_output_path}...")
+                    tool_map["write_file"].invoke({
+                        "path": str(readme_output_path),
+                        "content": readme_content
+                    })
+                    print(f"📄 Generated project README saved to: {readme_output_path}")
+                except Exception as e:
+                    print(f"⚠️ [Filesystem MCP] Error writing project README: {e}. Using local fallback...")
+                    try:
+                        readme_output_path.write_text(readme_content, encoding="utf-8")
+                        print(f"📄 Generated project README saved to: {readme_output_path}")
+                    except Exception as e2:
+                        print(f"❌ Error writing project output README: {e2}")
+            else:
+                try:
+                    readme_output_path.write_text(readme_content, encoding="utf-8")
+                    print(f"📄 Generated project README saved to: {readme_output_path}")
+                except Exception as e:
+                    print(f"❌ Error writing project output README: {e}")
+
+        # ── Safe Setup Command Execution ─────────────────────────────────────
+        await _run_safe_setup_commands(developer_output, project_output_dir)
+    finally:
+        if mcp_client:
+            mcp_client.close()
+
+
+async def _run_safe_setup_commands(developer_output: DeveloperOutput, cwd) -> None:
+    """Execute only allowlisted dependency-install commands, with NO shell.
+
+    Each command is parsed with ``shlex.split`` and run via
+    ``create_subprocess_exec`` (so shell metacharacters are never interpreted).
+    Only commands whose argv prefix exactly matches an allowlist entry are run;
+    everything else is skipped and logged.
+    """
+    all_cmds: list[str] = []
+    if developer_output.backend and developer_output.backend.setup_commands:
+        all_cmds.extend(developer_output.backend.setup_commands)
+    if developer_output.frontend and developer_output.frontend.setup_commands:
+        all_cmds.extend(developer_output.frontend.setup_commands)
+
+    for cmd in all_cmds:
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as e:
+            print(f"⛔ [Setup] Skipping unparseable command {cmd!r}: {e}")
+            continue
+        if not argv:
+            continue
+
+        # Reject any argv token containing shell metacharacters.
+        if any(any(c in _SHELL_METACHARS for c in token) for token in argv):
+            print(f"⛔ [Setup] Skipping command with shell metacharacters: {cmd!r}")
+            continue
+
+        # Only run if the argv prefix exactly matches an allowlist entry.
+        allowed = next(
+            (prefix for prefix in _SAFE_SETUP_COMMANDS if tuple(argv[: len(prefix)]) == prefix),
+            None,
+        )
+        if allowed is None:
+            print(f"⛔ [Setup] Skipping non-allowlisted command: {cmd!r}")
+            continue
+
+        print(f"⚙️ [Setup] Running (no shell): {' '.join(argv)} ...")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                print(f"✅ [Setup] Successfully completed: {' '.join(argv)}")
+            else:
+                err_msg = stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
+                print(f"⚠️ [Setup] '{' '.join(argv)}' exited {proc.returncode}: {err_msg[:200]}")
+        except Exception as exc:
+            print(f"⚠️ [Setup] Error executing '{' '.join(argv)}': {exc}")
 
 
 def run_backend_agent(architect_output: ArchitectOutput, designer_output: Optional[UIDesignerOutput] = None) -> BackendOutput:
@@ -494,48 +519,55 @@ def run_backend_agent(architect_output: ArchitectOutput, designer_output: Option
     
     # Connect Context7 and Filesystem
     context7_client = ThreadSafeMCPClient("npx", ["-y", "@upstash/context7-mcp@latest"])
-    filesystem_client = ThreadSafeMCPClient("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/Users/nikomendez/Documents/SWdevAIgency_project"])
-    
-    tools = context7_client.get_tools() + filesystem_client.get_tools()
-    
-    llm = llm_developer
-
-    agent = create_react_agent(llm, tools=tools)
-    arch_json = architect_output.model_dump_json(indent=2)
-    
-    prompt = (
-        f"{BACKEND_SYSTEM_PROMPT}\n\n"
-        "Generate the complete backend code based on this architecture. "
-        "If you need to consult documentation about NestJS, TypeORM, Postgres, etc., use Context7. "
-        "Additionally, you can use Filesystem tools to verify files if needed. "
-        "IMPORTANT: DO NOT search, list, or read files in directories outside the current project's backend, "
-        "especially NEVER enter folders like 'gestor_gastos' or 'fintrack_app'. "
-        "Only operate within the development context of this current project.\n\n"
-        f"{arch_json}"
+    filesystem_client = ThreadSafeMCPClient(
+        "npx", ["-y", "@modelcontextprotocol/server-filesystem", str(PROJECT_ROOT)]
     )
 
-    print("☕  Backend Developer Agent consulting tools and writing backend...")
-    response = agent.invoke({"messages": [HumanMessage(content=prompt)]}, config={"recursion_limit": 10})
-    
-    final_message = response["messages"][-1].content
-    cleaned = clean_llm_response(final_message)
-    cleaned = _fix_json(cleaned)
-
     try:
-        data = json_repair.loads(cleaned)
-        return BackendOutput.model_validate(data)
-    except Exception as exc:
-        print(f"   ⚠️ Backend parsing failed: {exc}. Retrying with direct prompt...")
-        messages = [
-            SystemMessage(content=BACKEND_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-            HumanMessage(content=RETRY_PROMPT.format(error=str(exc)))
-        ]
-        retry_res = llm.invoke(messages)
-        cleaned_retry = clean_llm_response(retry_res.content)
-        cleaned_retry = _fix_json(cleaned_retry)
-        data = json_repair.loads(cleaned_retry)
-        return BackendOutput.model_validate(data)
+        tools = context7_client.get_tools() + filesystem_client.get_tools()
+
+        llm = llm_developer
+
+        agent = create_react_agent(llm, tools=tools)
+        arch_json = architect_output.model_dump_json(indent=2)
+
+        prompt = (
+            f"{BACKEND_SYSTEM_PROMPT}\n\n"
+            "Generate the complete backend code based on this architecture. "
+            "If you need to consult documentation about NestJS, TypeORM, Postgres, etc., use Context7. "
+            "Additionally, you can use Filesystem tools to verify files if needed. "
+            "IMPORTANT: DO NOT search, list, or read files in directories outside the current project's backend, "
+            "especially NEVER enter folders like 'gestor_gastos' or 'fintrack_app'. "
+            "Only operate within the development context of this current project.\n\n"
+            f"{arch_json}"
+        )
+
+        print("☕  Backend Developer Agent consulting tools and writing backend...")
+        response = agent.invoke(
+            {"messages": [HumanMessage(content=prompt)]},
+            config={"recursion_limit": 100},
+        )
+
+        final_message = _final_ai_text(response["messages"])
+
+        try:
+            return BackendOutput.model_validate(_parse_json_robust(final_message))
+        except Exception as exc:
+            print(f"   ⚠️ Backend parsing failed: {exc}. Retrying with direct prompt...")
+            try:
+                messages = [
+                    SystemMessage(content=BACKEND_SYSTEM_PROMPT),
+                    HumanMessage(content=prompt),
+                    HumanMessage(content=RETRY_PROMPT.format(error=str(exc)))
+                ]
+                retry_res = llm.invoke(messages)
+                return BackendOutput.model_validate(_parse_json_robust(retry_res.content))
+            except Exception as retry_exc:
+                print(f"   ❌ Backend retry parsing failed: {retry_exc}")
+                raise
+    finally:
+        context7_client.close()
+        filesystem_client.close()
 
 
 def run_frontend_agent(architect_output: ArchitectOutput, designer_output: Optional[UIDesignerOutput] = None) -> FrontendOutput:
@@ -543,68 +575,75 @@ def run_frontend_agent(architect_output: ArchitectOutput, designer_output: Optio
     
     # Connect Context7 and Filesystem
     context7_client = ThreadSafeMCPClient("npx", ["-y", "@upstash/context7-mcp@latest"])
-    filesystem_client = ThreadSafeMCPClient("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/Users/nikomendez/Documents/SWdevAIgency_project"])
-    
-    tools = context7_client.get_tools() + filesystem_client.get_tools()
-    
-    llm = llm_developer
-
-    agent = create_react_agent(llm, tools=tools)
-    
-    arch_json = architect_output.model_dump_json(indent=2)
-    
-    # Format DESIGN.md and screen references
-    ui_context = ""
-    system_prompt = FRONTEND_SYSTEM_PROMPT
-    if designer_output:
-        system_prompt += "\nImplement the screens faithfully following the design system from the attached DESIGN.md. Colors, typography, and spacing must match the defined tokens exactly."
-        ui_context += "# DESIGN.md\n"
-        ui_context += f"{designer_output.design_system_notes}\n\n"
-        ui_context += "## SCREENS AND VIEWS REFERENCE:\n"
-        for scr in designer_output.screens:
-            ui_context += f"### Screen: {scr.name}\n"
-            ui_context += f"Description: {scr.description}\n"
-            if getattr(scr, 'stitch_screen_url', None):
-                ui_context += f"Stitch URL: {scr.stitch_screen_url}\n"
-            if getattr(scr, 'html_content', None):
-                html_snippet = scr.html_content
-                if len(html_snippet) > 800:
-                    html_snippet = html_snippet[:800] + "\n... [TRUNCATED FOR CONTEXT WINDOW] ..."
-                ui_context += f"HTML Reference (Truncated):\n```html\n{html_snippet}\n```\n"
-            ui_context += "\n"
-    else:
-        ui_context = "No UI design provided."
-        
-    prompt = (
-        f"Generate the complete Flutter frontend code based on this architecture and the provided screen design (Google Stitch). "
-        "If you need to consult documentation about Flutter, Widgets, http, etc., use Context7. "
-        "Additionally, you can use Filesystem tools to verify files if needed. "
-        "IMPORTANT: DO NOT search, list, or read files in directories outside the current project's frontend, "
-        "especially NEVER enter folders like 'gestor_gastos' or 'fintrack_app'. "
-        "Only operate within the development context of this current project.\n\n"
-        f"ARCHITECTURE:\n{arch_json}\n\n"
-        f"INTERFACE DESIGN AND SCREENS:\n{ui_context}"
+    filesystem_client = ThreadSafeMCPClient(
+        "npx", ["-y", "@modelcontextprotocol/server-filesystem", str(PROJECT_ROOT)]
     )
 
-    print("📱  Frontend Developer Agent consulting tools and writing frontend...")
-    response = agent.invoke({"messages": [HumanMessage(content=prompt)]}, config={"recursion_limit": 10})
-    
-    final_message = response["messages"][-1].content
-    cleaned = clean_llm_response(final_message)
-    cleaned = _fix_json(cleaned)
-
     try:
-        data = json_repair.loads(cleaned)
-        return FrontendOutput.model_validate(data)
-    except Exception as exc:
-        print(f"   ⚠️ Frontend parsing failed: {exc}. Retrying with direct prompt...")
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt),
-            HumanMessage(content=RETRY_PROMPT.format(error=str(exc)))
-        ]
-        retry_res = llm.invoke(messages)
-        cleaned_retry = clean_llm_response(retry_res.content)
-        cleaned_retry = _fix_json(cleaned_retry)
-        data = json_repair.loads(cleaned_retry)
-        return FrontendOutput.model_validate(data)
+        tools = context7_client.get_tools() + filesystem_client.get_tools()
+
+        llm = llm_developer
+
+        agent = create_react_agent(llm, tools=tools)
+
+        arch_json = architect_output.model_dump_json(indent=2)
+
+        # Format DESIGN.md and screen references
+        ui_context = ""
+        system_prompt = FRONTEND_SYSTEM_PROMPT
+        if designer_output:
+            system_prompt += "\nImplement the screens faithfully following the design system from the attached DESIGN.md. Colors, typography, and spacing must match the defined tokens exactly."
+            ui_context += "# DESIGN.md\n"
+            ui_context += f"{designer_output.design_system_notes}\n\n"
+            ui_context += "## SCREENS AND VIEWS REFERENCE:\n"
+            for scr in designer_output.screens:
+                ui_context += f"### Screen: {scr.name}\n"
+                ui_context += f"Description: {scr.description}\n"
+                if getattr(scr, 'stitch_screen_url', None):
+                    ui_context += f"Stitch URL: {scr.stitch_screen_url}\n"
+                if getattr(scr, 'html_content', None):
+                    html_snippet = scr.html_content
+                    if len(html_snippet) > 800:
+                        html_snippet = html_snippet[:800] + "\n... [TRUNCATED FOR CONTEXT WINDOW] ..."
+                    ui_context += f"HTML Reference (Truncated):\n```html\n{html_snippet}\n```\n"
+                ui_context += "\n"
+        else:
+            ui_context = "No UI design provided."
+
+        prompt = (
+            f"Generate the complete Flutter frontend code based on this architecture and the provided screen design (Google Stitch). "
+            "If you need to consult documentation about Flutter, Widgets, http, etc., use Context7. "
+            "Additionally, you can use Filesystem tools to verify files if needed. "
+            "IMPORTANT: DO NOT search, list, or read files in directories outside the current project's frontend, "
+            "especially NEVER enter folders like 'gestor_gastos' or 'fintrack_app'. "
+            "Only operate within the development context of this current project.\n\n"
+            f"ARCHITECTURE:\n{arch_json}\n\n"
+            f"INTERFACE DESIGN AND SCREENS:\n{ui_context}"
+        )
+
+        print("📱  Frontend Developer Agent consulting tools and writing frontend...")
+        response = agent.invoke(
+            {"messages": [HumanMessage(content=prompt)]},
+            config={"recursion_limit": 100},
+        )
+
+        final_message = _final_ai_text(response["messages"])
+
+        try:
+            return FrontendOutput.model_validate(_parse_json_robust(final_message))
+        except Exception as exc:
+            print(f"   ⚠️ Frontend parsing failed: {exc}. Retrying with direct prompt...")
+            try:
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=prompt),
+                    HumanMessage(content=RETRY_PROMPT.format(error=str(exc)))
+                ]
+                retry_res = llm.invoke(messages)
+                return FrontendOutput.model_validate(_parse_json_robust(retry_res.content))
+            except Exception as retry_exc:
+                print(f"   ❌ Frontend retry parsing failed: {retry_exc}")
+                raise
+    finally:
+        context7_client.close()
+        filesystem_client.close()

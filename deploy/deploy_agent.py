@@ -1,12 +1,52 @@
 import os
 import re
+import json
 import shutil
 import asyncio
 import subprocess
 from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
 from config.llm_config import llm_developer
+from config.paths import validate_project_name, UnsafePathError
 from langchain_core.messages import HumanMessage, SystemMessage
+
+try:
+    import tomllib as _toml  # Python 3.11+
+    _TOML_LOADS = lambda s: _toml.loads(s)
+except Exception:  # pragma: no cover
+    try:
+        import toml as _toml  # type: ignore
+        _TOML_LOADS = lambda s: _toml.loads(s)
+    except Exception:
+        _TOML_LOADS = None
+
+
+_MINIMAL_FLY_TOML_TEMPLATE = '''\
+app = "{name}"
+primary_region = "mad"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+'''
+
+_MINIMAL_RAILWAY_JSON_TEMPLATE = '''\
+{{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {{
+    "builder": "DOCKERFILE"
+  }},
+  "deploy": {{
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }}
+}}
+'''
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
 
@@ -55,7 +95,17 @@ def generate_fly_config(project_name: str, docker_compose_path: str) -> str:
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
     response = llm_developer.invoke(messages)
     content = clean_txt_response(response.content)
-    
+
+    # Validate that the generated TOML parses; fall back to a known-good template.
+    if _TOML_LOADS is not None:
+        try:
+            _TOML_LOADS(content)
+        except Exception as e:
+            print(f"   ⚠️  [Deploy] Generated fly.toml did not parse ({e}); using minimal template.")
+            content = _MINIMAL_FLY_TOML_TEMPLATE.format(name=project_name)
+    else:
+        print("   ⚠️  [Deploy] No TOML parser available; cannot validate fly.toml content.")
+
     out_dir = f"./output/{project_name}"
     os.makedirs(out_dir, exist_ok=True)
     fly_path = os.path.join(out_dir, "fly.toml")
@@ -76,7 +126,14 @@ def generate_railway_config(project_name: str) -> str:
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
     response = llm_developer.invoke(messages)
     content = clean_txt_response(response.content)
-    
+
+    # Validate that the generated JSON parses; fall back to a known-good template.
+    try:
+        json.loads(content)
+    except Exception as e:
+        print(f"   ⚠️  [Deploy] Generated railway.json did not parse ({e}); using minimal template.")
+        content = _MINIMAL_RAILWAY_JSON_TEMPLATE
+
     out_dir = f"./output/{project_name}"
     os.makedirs(out_dir, exist_ok=True)
     railway_path = os.path.join(out_dir, "railway.json")
@@ -90,8 +147,12 @@ def generate_railway_config(project_name: str) -> str:
 
 async def run_deploy(project_name: str, platform="auto") -> DeployOutput:
     """Deploy the project or generate instructions if no credentials/tools exist."""
+    # Validate before the name reaches any subprocess argument (a leading '-'
+    # would otherwise be parsed as a CLI flag).
+    project_name = validate_project_name(project_name)
+
     tools = check_deploy_tools()
-    
+
     out_dir = f"./output/{project_name}"
     os.makedirs(out_dir, exist_ok=True)
     
@@ -132,17 +193,21 @@ async def run_deploy(project_name: str, platform="auto") -> DeployOutput:
                 
             print("   🌐 Configuring domain...")
             # 2. flyctl launch --no-deploy
-            subprocess.run(["fly", "launch", "--no-deploy", "--name", project_name, "--region", "mad"], cwd=out_dir, capture_output=True)
+            launch_res = subprocess.run(["fly", "launch", "--no-deploy", "--name", project_name, "--region", "mad"], cwd=out_dir, capture_output=True, text=True)
+            if launch_res.returncode != 0:
+                raise Exception(f"'fly launch' failed (exit {launch_res.returncode}): {launch_res.stderr.strip()}")
             # 3. flyctl deploy --local-only
-            subprocess.run(["fly", "deploy", "--local-only"], cwd=out_dir, capture_output=True)
-            
+            deploy_res = subprocess.run(["fly", "deploy", "--local-only"], cwd=out_dir, capture_output=True, text=True)
+            if deploy_res.returncode != 0:
+                raise Exception(f"'fly deploy' failed (exit {deploy_res.returncode}): {deploy_res.stderr.strip()}")
+
             # Fetch status
             status_res = subprocess.run(["fly", "status"], cwd=out_dir, capture_output=True, text=True)
             primary_url = f"https://{project_name}.fly.dev"
-            
+
             print(f"   ✅ Deployment completed: {primary_url}")
             targets.append(DeployTarget(platform="fly", app_url=primary_url, deploy_status="success", logs=[status_res.stdout]))
-            
+
         except Exception as e:
             print(f"   ❌ [Deploy Fly] Error: {e}")
             targets.append(DeployTarget(platform="fly", app_url="", deploy_status="failed", logs=[str(e)]))
@@ -162,12 +227,16 @@ async def run_deploy(project_name: str, platform="auto") -> DeployOutput:
                 raise Exception("Railway CLI not authenticated. Run 'railway login' first.")
                 
             print("   🌐 Configuring domain...")
-            subprocess.run(["railway", "init", "--name", project_name], cwd=out_dir, capture_output=True)
-            subprocess.run(["railway", "up"], cwd=out_dir, capture_output=True)
-            
+            init_res = subprocess.run(["railway", "init", "--name", project_name], cwd=out_dir, capture_output=True, text=True)
+            if init_res.returncode != 0:
+                raise Exception(f"'railway init' failed (exit {init_res.returncode}): {init_res.stderr.strip()}")
+            up_res = subprocess.run(["railway", "up"], cwd=out_dir, capture_output=True, text=True)
+            if up_res.returncode != 0:
+                raise Exception(f"'railway up' failed (exit {up_res.returncode}): {up_res.stderr.strip()}")
+
             domain_res = subprocess.run(["railway", "domain"], cwd=out_dir, capture_output=True, text=True)
             primary_url = domain_res.stdout.strip() if domain_res.stdout else f"https://{project_name}.up.railway.app"
-            
+
             print(f"   ✅ Deployment completed: {primary_url}")
             targets.append(DeployTarget(platform="railway", app_url=primary_url, deploy_status="success", logs=[domain_res.stdout]))
             
@@ -178,23 +247,19 @@ async def run_deploy(project_name: str, platform="auto") -> DeployOutput:
             
     # ── RENDER DEPLOYMENT ────────────────────────────────────────────────────
     elif selected_platform == "render" and tools["render"]:
-        print("   📦 Building Docker image...")
-        await asyncio.sleep(2)
-        print("   🚀 Deploying on Render...")
-        
-        try:
-            print("   🌐 Configuring domain...")
-            # Render API call using RENDER_API_KEY
-            # For robust simulation and fallback:
-            primary_url = f"https://{project_name}.onrender.com"
-            print(f"   ✅ Deployment completed: {primary_url}")
-            targets.append(DeployTarget(platform="render", app_url=primary_url, deploy_status="success", logs=["Render deploy initiated via REST API"]))
-            
-        except Exception as e:
-            print(f"   ❌ [Deploy Render] Error: {e}")
-            targets.append(DeployTarget(platform="render", app_url="", deploy_status="failed", logs=[str(e)]))
-            selected_platform = None
-            
+        print("   🚀 Render deployment requested...")
+        # The Render REST API integration is not implemented yet. Do NOT fabricate
+        # a *.onrender.com URL or claim success; report it honestly and fall back
+        # to manual instructions below.
+        msg = (
+            "Automated Render deployment is not implemented yet (no API call is made). "
+            "Use the manual instructions below to deploy via dashboard.render.com."
+        )
+        print(f"   ⚠️  [Deploy Render] {msg}")
+        targets.append(DeployTarget(platform="render", app_url="", deploy_status="pending", logs=[msg]))
+        primary_url = ""
+        selected_platform = None
+
     # ── FALLBACK TO MANUAL INSTRUCTIONS ──────────────────────────────────────
     if not primary_url or selected_platform is None:
         print("   ⚠️  Automated deployment not available due to missing tools or credentials.")
@@ -215,6 +280,7 @@ Generate the step-by-step guide with complete console commands and brief explana
             response = llm_developer.invoke(messages)
             instructions = clean_txt_response(response.content)
         except Exception as e:
+            print(f"   ⚠️  [Deploy] Could not generate detailed instructions via LLM: {e}")
             instructions = f"Basic deployment guide for {project_name}:\n- Fly.io: fly launch && fly deploy\n- Railway: railway init && railway up\n- Render: connect your repository on dashboard.render.com"
 
         primary_url = "not_deployed"
@@ -227,7 +293,8 @@ Generate the step-by-step guide with complete console commands and brief explana
         try:
             response = llm_developer.invoke(messages)
             share_message = clean_txt_response(response.content)
-        except Exception:
+        except Exception as e:
+            print(f"   ⚠️  [Deploy] Could not generate share message via LLM: {e}")
             share_message = f"I just deployed {project_name} with devAIteam 🚀\nYou can see it at: {primary_url} — Generated 100% by AI locally"
     else:
         share_message = "Project not automatically deployed."

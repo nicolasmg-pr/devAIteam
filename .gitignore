@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!env.example
 
 # Python
 __pycache__/
@@ -67,3 +68,6 @@ Desktop.ini
 
 # Project local artifacts & caches
 output/
+
+# Pytest
+.pytest_cache/

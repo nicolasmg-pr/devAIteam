@@ -18,36 +18,48 @@ def format_col(val: str, width: int, align="left") -> str:
 def check_mcp_connection(name: str, config: dict, env_required: str = None) -> tuple[bool, str, int]:
     """Test connecting to an MCP server and listing its tools."""
     start_time = time.time()
-    
-    # Check environment variable if required
+
+    # Resolve the actually-present token (accept GITHUB_TOKEN as a fallback) and
+    # inject it under the canonical key the server expects, never as None.
+    env = None
     if env_required:
         token = os.environ.get(env_required) or os.environ.get("GITHUB_TOKEN")
         if not token:
             return False, f"Missing {env_required} env variable", 0
-            
+        # Preserve PATH/HOME etc. so the spawned process can locate its runtime.
+        env = {**os.environ, env_required: token}
+
+    client = None
     try:
         # Check command availability
         if not shutil.which(config["command"]):
             return False, f"Command '{config['command']}' not found on system PATH", 0
-            
+
         # Instantiate client which syncs and lists tools
-        env = {env_required: os.environ.get(env_required)} if env_required else None
         client = ThreadSafeMCPClient(
             command=config["command"],
             args=config["args"],
             env=env
         )
-        
+
         tools = client.get_tools()
         elapsed = int((time.time() - start_time) * 1000)
-        
+
         if not tools:
             return False, "Connected but returned 0 tools", elapsed
-            
+
         return True, f"Success ({len(tools)} tools loaded)", elapsed
     except Exception as e:
         elapsed = int((time.time() - start_time) * 1000)
-        return False, str(e)[:50], elapsed
+        # Keep the FULL message so the keyword-matching troubleshooting logic can
+        # still see substrings like 'GITHUB_PERSONAL_ACCESS_TOKEN' or 'PATH'.
+        return False, str(e), elapsed
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 def run_mcp_check():
     """Diagnostic tool to inspect all configured Model Context Protocol (MCP) connections."""

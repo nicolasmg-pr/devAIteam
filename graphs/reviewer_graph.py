@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import traceback
+import uuid
 from typing import Optional, Annotated
 import operator
 
@@ -11,6 +12,7 @@ from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
 
+from config.paths import project_dir, safe_join, UnsafePathError
 from agents.developer_agent import DeveloperOutput
 from agents.qa_agent import QAOutput
 from agents.architect_agent import _run_async_in_thread
@@ -81,7 +83,7 @@ def format_review_node(state: ReviewerState) -> dict:
     if not r:
         return {}
 
-    emoji = "🟢" if "approved" in r.overall_verdict else "🔴"
+    emoji = "🟢" if r.overall_verdict in {"approved", "approved_with_suggestions"} else "🔴"
     
     print("\n" + "━" * 40)
     print(f"👁  CODE REVIEW — Round {r.round_number}")
@@ -122,9 +124,13 @@ def human_input_node(state: ReviewerState) -> dict:
 
     # When resumed, human_input receives the payload from Command(resume=value)
     human_input = str(human_input).strip()
-    
-    approved = human_input.lower().startswith('a') or human_input.lower().startswith('f')
-    
+
+    # Parse the leading token strictly: approve only on exactly a/s/f.
+    # 'r' and anything unrecognized count as not-approved.
+    tokens = human_input.lower().split()
+    leading = tokens[0] if tokens else ""
+    approved = leading in {"a", "s", "f"}
+
     from datetime import datetime
     decision = HumanDecision(
         approved=approved,
@@ -161,23 +167,40 @@ import os
 import subprocess
 from agents.mcp_client import ThreadSafeMCPClient
 
-def _apply_code_change(change: CodeChange):
-    """Locate the original snippet in the local file and replace it with the proposed snippet."""
-    base_dir = "/Users/nikomendez/Documents/SWdevAIgency_project"
-    full_path = os.path.join(base_dir, change.file)
+def _apply_code_change(change: CodeChange, project_name: str):
+    """Locate the original snippet in the generated project's file and replace it.
+
+    Changes are applied to the GENERATED project's directory under output/, never
+    to the platform's own repo.
+    """
+    # Slugify the project name the same way main.py does.
+    slug = project_name.lower().replace(" ", "-").replace("_", "-")
+    try:
+        base = project_dir(slug)
+    except UnsafePathError as e:
+        print(f"⚠️  [Reviewer] Unsafe project name, skipping change: {e}")
+        return
+
+    try:
+        full_path = safe_join(base, change.file)
+    except UnsafePathError as e:
+        print(f"⚠️  [Reviewer] Unsafe file path, skipping change: {e}")
+        return
+
     if not os.path.exists(full_path):
         print(f"⚠️  [Reviewer] File not found to apply change: {full_path}")
         return
-        
+
     try:
         with open(full_path, "r", encoding="utf-8") as f:
             content = f.read()
-            
+
         orig = change.original_snippet.strip()
         prop = change.proposed_snippet
-        
+
         if orig in content:
-            content = content.replace(orig, prop)
+            # Replace only the FIRST occurrence.
+            content = content.replace(orig, prop, 1)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
             print(f"✅ [Reviewer] Change successfully applied locally in: {change.file}")
@@ -246,7 +269,7 @@ def finalize_node(state: ReviewerState) -> dict:
     if final_status in ["approved", "approved_with_suggestions"] and approved_changes:
         print(f"💾 Applying {len(approved_changes)} approved changes to the workspace...")
         for change in approved_changes:
-            _apply_code_change(change)
+            _apply_code_change(change, state.developer_output.project_name)
 
     out = ReviewerOutput(
         project_name=state.developer_output.project_name,
@@ -349,4 +372,16 @@ def build_reviewer_graph():
 
 # Pre-built graph ready for import
 reviewer_graph = build_reviewer_graph()
-reviewer_config = {"configurable": {"thread_id": "review-session-1"}}
+
+
+def make_reviewer_config() -> dict:
+    """Return a fresh reviewer config with a unique thread_id per run.
+
+    Each pipeline run must use its own checkpoint thread so concurrent or
+    sequential runs do not collide on a shared MemorySaver thread.
+    """
+    return {"configurable": {"thread_id": f"review-{uuid.uuid4()}"}}
+
+
+# Backward-compat default config for imports; main.py calls the factory per run.
+reviewer_config = make_reviewer_config()

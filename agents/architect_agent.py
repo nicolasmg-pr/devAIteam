@@ -3,14 +3,17 @@ and proposes a modern, scalable architecture with justifications."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import queue
 import re
+import threading
 from typing import Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from config.llm_config import llm_architect
-from tools.llm_helpers import clean_llm_response
+from tools.llm_helpers import clean_llm_response, parse_llm_json
 
 from agents.pm_agent import PMOutput
 
@@ -146,77 +149,77 @@ def _fix_json(text: str) -> str:
     fixed = re.sub(r",\s*([}\]])", r"\1", text)
     return fixed
 
-import asyncio
-import threading
-import queue
-import json_repair
-
 
 async def enrich_with_context7(tech_stack: TechStack) -> dict:
     """Connect to Context7 MCP and retrieve best practices for the tech stack."""
     from agents.mcp_client import get_mcp_tools, CONTEXT7_MCP_CONFIG
-    
-    tools = get_mcp_tools(CONTEXT7_MCP_CONFIG, "stdio")
+
+    tools, client = get_mcp_tools(CONTEXT7_MCP_CONFIG, "stdio", return_client=True)
     if not tools:
         print("⚠️ [Context7] Could not load Context7 tools. Fallback.")
+        if client:
+            client.close()
         return {}
-        
+
     tool_map = {t.name: t for t in tools}
     docs_found = {}
-    
+
     technologies = {
         "frontend": tech_stack.frontend,
         "backend": tech_stack.backend,
         "database": tech_stack.database
     }
-    
-    for key, tech_name in technologies.items():
-        if not tech_name or tech_name.lower() in ["none", "null", "n/a", "no"]:
-            continue
-            
-        print(f"🔍 [Context7] Searching ID for library: {tech_name}")
-        try:
-            resolved_id = None
-            if "resolve-library-id" in tool_map:
-                res = tool_map["resolve-library-id"].invoke({
-                    "query": tech_name,
-                    "libraryName": tech_name
-                })
-                import re
-                match = re.search(r"(/[a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)", res)
-                if match:
-                    resolved_id = match.group(1)
-                    print(f"🔍 [Context7] ID resolved for {tech_name}: {resolved_id}")
-            
-            if not resolved_id:
-                tech_lower = tech_name.lower()
-                if "nest" in tech_lower:
-                    resolved_id = "/nestjs/nest"
-                elif "flutter" in tech_lower:
-                    resolved_id = "/flutter/flutter"
-                elif "postgres" in tech_lower:
-                    resolved_id = "/postgres/postgres"
-                else:
-                    resolved_id = f"/{tech_lower}/{tech_lower}"
-            
-            doc_content = ""
-            if "query-docs" in tool_map:
-                doc_content = tool_map["query-docs"].invoke({
-                    "libraryId": resolved_id,
-                    "query": "best practices"
-                })
-            elif "get-library-docs" in tool_map:
-                doc_content = tool_map["get-library-docs"].invoke({
-                    "libraryId": resolved_id,
-                    "topic": "best practices"
-                })
-            
-            if doc_content:
-                docs_found[tech_name] = doc_content
-                print(f"✅ [Context7] Best practices retrieved for {tech_name}")
-        except Exception as e:
-            print(f"⚠️ [Context7] Error searching documentation for {tech_name}: {e}")
-            
+
+    try:
+        for key, tech_name in technologies.items():
+            if not tech_name or tech_name.lower() in ["none", "null", "n/a", "no"]:
+                continue
+
+            print(f"🔍 [Context7] Searching ID for library: {tech_name}")
+            try:
+                resolved_id = None
+                if "resolve-library-id" in tool_map:
+                    res = await asyncio.to_thread(tool_map["resolve-library-id"].invoke, {
+                        "query": tech_name,
+                        "libraryName": tech_name
+                    })
+                    match = re.search(r"(/[a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)", str(res))
+                    if match:
+                        resolved_id = match.group(1)
+                        print(f"🔍 [Context7] ID resolved for {tech_name}: {resolved_id}")
+
+                if not resolved_id:
+                    tech_lower = tech_name.lower()
+                    if "nest" in tech_lower:
+                        resolved_id = "/nestjs/nest"
+                    elif "flutter" in tech_lower:
+                        resolved_id = "/flutter/flutter"
+                    elif "postgres" in tech_lower:
+                        resolved_id = "/postgres/postgres"
+                    else:
+                        resolved_id = f"/{tech_lower}/{tech_lower}"
+
+                doc_content = ""
+                if "query-docs" in tool_map:
+                    doc_content = await asyncio.to_thread(tool_map["query-docs"].invoke, {
+                        "libraryId": resolved_id,
+                        "query": "best practices"
+                    })
+                elif "get-library-docs" in tool_map:
+                    doc_content = await asyncio.to_thread(tool_map["get-library-docs"].invoke, {
+                        "libraryId": resolved_id,
+                        "topic": "best practices"
+                    })
+
+                if doc_content:
+                    docs_found[tech_name] = doc_content
+                    print(f"✅ [Context7] Best practices retrieved for {tech_name}")
+            except Exception as e:
+                print(f"⚠️ [Context7] Error searching documentation for {tech_name}: {e}")
+    finally:
+        if client:
+            client.close()
+
     return docs_found
 
 
@@ -267,9 +270,8 @@ def refine_architecture_with_docs(arch_output: ArchitectOutput, context7_docs: d
                 SystemMessage(content="You are a Senior Software Architect. Respond strictly with JSON."),
                 HumanMessage(content=refine_prompt)
             ])
-            refine_cleaned = clean_llm_response(refine_res.content)
-            refine_data = json_repair.loads(refine_cleaned)
-            if "key_decisions" in refine_data and isinstance(refine_data["key_decisions"], list):
+            refine_data = parse_llm_json(refine_res.content)
+            if isinstance(refine_data, dict) and isinstance(refine_data.get("key_decisions"), list):
                 arch_output.key_decisions = refine_data["key_decisions"]
                 print("✅ [Architect] Decisions successfully updated.")
         except Exception as refine_err:
@@ -299,19 +301,17 @@ def run_architect_agent(pm_output: PMOutput) -> ArchitectOutput:
     
     print("🏗️  Architect Agent generating initial architecture...")
     response = llm.invoke(messages)
-    cleaned = clean_llm_response(response.content)
-    cleaned = _fix_json(cleaned)
 
     try:
-        data = json_repair.loads(cleaned)
-        return ArchitectOutput.model_validate(data)
+        return ArchitectOutput.model_validate(parse_llm_json(response.content))
     except Exception as exc:
         print(f"   ⚠️ Architecture parsing failed: {exc}. Retrying with direct prompt...")
-        messages = messages + [
-            HumanMessage(content=ARCHITECT_RETRY_PROMPT.format(error=str(exc)))
-        ]
-        retry_res = llm.invoke(messages)
-        cleaned_retry = clean_llm_response(retry_res.content)
-        cleaned_retry = _fix_json(cleaned_retry)
-        data = json_repair.loads(cleaned_retry)
-        return ArchitectOutput.model_validate(data)
+        try:
+            messages = messages + [
+                HumanMessage(content=ARCHITECT_RETRY_PROMPT.format(error=str(exc)))
+            ]
+            retry_res = llm.invoke(messages)
+            return ArchitectOutput.model_validate(parse_llm_json(retry_res.content))
+        except Exception as retry_exc:
+            print(f"   ❌ Architecture retry parsing failed: {retry_exc}")
+            raise

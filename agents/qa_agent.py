@@ -4,16 +4,20 @@ to produce test cases, test files, and code quality analysis."""
 from __future__ import annotations
 
 import json
+import os
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel, Field, ValidationError
 from config.llm_config import llm_qa
-from tools.llm_helpers import clean_llm_response
+from config.paths import OUTPUT_DIR, ensure_output_dir, safe_join, UnsafePathError
+from tools.llm_helpers import parse_llm_json
 
 from agents.pm_agent import PMOutput
 from agents.developer_agent import DeveloperOutput
+from agents.mcp_client import ThreadSafeMCPClient
 
 
 # ── Pydantic output models ──────────────────────────────────────────────────
@@ -220,13 +224,11 @@ def _invoke_with_retry(
     for attempt in range(1 + max_retries):
         response = llm.invoke(messages)
         raw_text: str = response.content  # type: ignore[assignment]
-        cleaned = clean_llm_response(raw_text)
-        cleaned = _fix_json(cleaned)
 
         try:
-            data = json.loads(cleaned, strict=False)
+            data = parse_llm_json(raw_text)
             return parse_fn(data)
-        except (json.JSONDecodeError, Exception) as exc:
+        except (json.JSONDecodeError, ValidationError, KeyError, TypeError, ValueError) as exc:
             last_error = exc
             print(f"   ⚠️  [{label}] Attempt {attempt + 1} failed: {exc}")
             if attempt < max_retries:
@@ -278,124 +280,163 @@ def _full_dev_code(dev_output: DeveloperOutput) -> str:
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-import os
-from langgraph.prebuilt import create_react_agent
-from agents.mcp_client import ThreadSafeMCPClient
-import json_repair
-
 async def run_e2e_tests(developer_output: DeveloperOutput) -> dict:
     """Connect to Playwright MCP and perform basic E2E verification or simulate via HTTP."""
     from agents.mcp_client import get_mcp_tools, PLAYWRIGHT_MCP_CONFIG
     import aiohttp
-    import re
-    
-    # 1. Detect URLs or endpoints
-    urls_to_test = ["http://localhost:3000"]
+
+    # 1. Detect URLs or endpoints. Base URL/port is derived from the environment so
+    #    it is not hardcoded to localhost:3000.
+    base_url = os.getenv("E2E_BASE_URL", "http://localhost:3000").rstrip("/")
+    urls_to_test = [base_url]
+
+    def _join_route(prefix: str, path: str) -> str:
+        prefix = (prefix or "").strip("/")
+        path = (path or "").strip("/")
+        segments = [seg for seg in (prefix, path) if seg]
+        return "/".join(segments)
+
     for f in developer_output.backend.files:
-        paths = re.findall(r"@Get\(['\"]([^'\"]+)['\"]\)", f.content)
-        for p in paths:
-            if p and not p.startswith("http"):
-                clean_path = p.strip("/")
-                url = f"http://localhost:3000/{clean_path}"
-                if url not in urls_to_test:
-                    urls_to_test.append(url)
-                    
+        # Pick up the @Controller('prefix') so routes are rooted correctly.
+        controller_match = re.search(r"@Controller\(\s*['\"]([^'\"]*)['\"]", f.content)
+        controller_prefix = controller_match.group(1) if controller_match else ""
+
+        # Parse GET/POST/PUT/DELETE route decorators.
+        route_paths = re.findall(
+            r"@(?:Get|Post|Put|Delete|Patch)\(\s*['\"]([^'\"]+)['\"]\s*\)",
+            f.content,
+        )
+        # Decorators with no explicit path map to the controller root.
+        if re.search(r"@(?:Get|Post|Put|Delete|Patch)\(\s*\)", f.content):
+            route_paths.append("")
+
+        for p in route_paths:
+            if p.startswith("http"):
+                continue
+            full_route = _join_route(controller_prefix, p)
+            url = f"{base_url}/{full_route}" if full_route else base_url
+            if url not in urls_to_test:
+                urls_to_test.append(url)
+
     print(f"🕵️  [QA E2E] Endpoints detected to test: {urls_to_test}")
-    
+
     # 2. Connect to Playwright MCP
-    tools = get_mcp_tools(PLAYWRIGHT_MCP_CONFIG, "stdio")
+    tools, mcp_client = get_mcp_tools(PLAYWRIGHT_MCP_CONFIG, "stdio", return_client=True)
     tool_map = {t.name: t for t in tools} if tools else {}
-    
+
     e2e_results = {}
-    
-    if "playwright_navigate" in tool_map and "playwright_screenshot" in tool_map:
-        print("🎭 [QA E2E] Playwright MCP available. Starting E2E tests...")
-        for url in urls_to_test:
-            try:
-                print(f"🌐 Navigating to: {url}")
-                nav_res = tool_map["playwright_navigate"].invoke({"url": url})
-                screenshot_name = f"screenshot_{re.sub(r'[^a-zA-Z0-9]', '_', url)}.png"
-                screenshot_path = f"./output/tests/{screenshot_name}"
-                os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
-                
-                tool_map["playwright_screenshot"].invoke({
-                    "path": screenshot_path
-                })
-                e2e_results[url] = {
-                    "status": "success",
-                    "screenshot_path": screenshot_path,
-                    "info": str(nav_res)
-                }
-            except Exception as e:
-                print(f"⚠️ Error navigating/capturing {url}: {e}")
-                e2e_results[url] = {
-                    "status": "error",
-                    "error": str(e)
-                }
-    else:
-        print("⚠️ [QA E2E] Playwright MCP not available. Using fallback with aiohttp...")
-        async with aiohttp.ClientSession() as session:
+
+    import asyncio
+
+    tests_dir = ensure_output_dir() / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if "playwright_navigate" in tool_map and "playwright_screenshot" in tool_map:
+            print("🎭 [QA E2E] Playwright MCP available. Starting E2E tests...")
             for url in urls_to_test:
                 try:
-                    print(f"🔗 Performing GET (aiohttp) to: {url}")
-                    timeout = aiohttp.ClientTimeout(total=5)
-                    async with session.get(url, timeout=timeout) as response:
+                    print(f"🌐 Navigating to: {url}")
+                    nav_res = await asyncio.to_thread(
+                        tool_map["playwright_navigate"].invoke, {"url": url}
+                    )
+                    screenshot_name = f"screenshot_{re.sub(r'[^a-zA-Z0-9]', '_', url)}.png"
+                    screenshot_path = str(tests_dir / screenshot_name)
+
+                    await asyncio.to_thread(
+                        tool_map["playwright_screenshot"].invoke,
+                        {"path": screenshot_path},
+                    )
+                    e2e_results[url] = {
+                        "status": "success",
+                        "screenshot_path": screenshot_path,
+                        "info": str(nav_res)
+                    }
+                except Exception as e:
+                    print(f"⚠️ Error navigating/capturing {url}: {e}")
+                    e2e_results[url] = {
+                        "status": "error",
+                        "error": str(e)
+                    }
+        else:
+            print("⚠️ [QA E2E] Playwright MCP not available. Using fallback with aiohttp...")
+            async with aiohttp.ClientSession() as session:
+                for url in urls_to_test:
+                    try:
+                        print(f"🔗 Performing GET (aiohttp) to: {url}")
+                        timeout = aiohttp.ClientTimeout(total=5)
+                        async with session.get(url, timeout=timeout) as response:
+                            e2e_results[url] = {
+                                "status": "simulated",
+                                "http_code": response.status,
+                                "reason": response.reason,
+                                "screenshot_path": "not available (simulated)"
+                            }
+                    except Exception as e:
+                        error_msg = str(e)
+                        status_name = "simulated_error"
+                        # Check if the connection failed because the local server is offline
+                        if "connection refused" in error_msg.lower() or "cannot connect to host" in error_msg.lower() or "timeout" in error_msg.lower():
+                            status_name = "server_offline"
+
                         e2e_results[url] = {
-                            "status": "simulated",
-                            "http_code": response.status,
-                            "reason": response.reason,
+                            "status": status_name,
+                            "error": error_msg,
                             "screenshot_path": "not available (simulated)"
                         }
-                except Exception as e:
-                    e2e_results[url] = {
-                        "status": "simulated_error",
-                        "error": str(e),
-                        "screenshot_path": "not available (simulated)"
-                    }
-                    
+    finally:
+        if mcp_client:
+            mcp_client.close()
+
     return e2e_results
 
 
 async def generate_test_files_with_filesystem(test_files: list[TestFile]):
     """Save QA test files to ./output/tests/ using Filesystem MCP or Python fallback."""
     from agents.mcp_client import get_mcp_tools, FILESYSTEM_MCP_CONFIG
-    
-    tools = get_mcp_tools(FILESYSTEM_MCP_CONFIG, "stdio")
+
+    tools, mcp_client = get_mcp_tools(FILESYSTEM_MCP_CONFIG, "stdio", return_client=True)
     tool_map = {t.name: t for t in tools} if tools else {}
-    
-    test_dir = "./output/tests"
-    os.makedirs(test_dir, exist_ok=True)
-    
+
+    test_dir = ensure_output_dir() / "tests"
+    test_dir.mkdir(parents=True, exist_ok=True)
+
     mcp_available = "write_file" in tool_map
-    
-    for f in test_files:
-        rel_path = os.path.join("tests", f.filename)
-        
-        if mcp_available:
+
+    try:
+        for f in test_files:
+            # Validate the LLM-supplied filename so it cannot escape the test dir.
             try:
-                full_path = os.path.join("/Users/nikomendez/Documents/SWdevAIgency_project/output", rel_path)
-                parent_dir = os.path.dirname(full_path)
-                os.makedirs(parent_dir, exist_ok=True)
-                
-                print(f"🚀 [Filesystem MCP] Saving test file: {rel_path}...")
-                tool_map["write_file"].invoke({
-                    "path": full_path,
-                    "content": f.content
-                })
-                print(f"📄 Saved test: {rel_path}")
+                safe_path = safe_join(test_dir, f.filename)
+            except UnsafePathError as ue:
+                print(f"⚠️ [QA] Skipping test file with unsafe name {f.filename!r}: {ue}")
                 continue
+
+            rel_path = os.path.join("tests", f.filename)
+
+            if mcp_available:
+                try:
+                    safe_path.parent.mkdir(parents=True, exist_ok=True)
+                    print(f"🚀 [Filesystem MCP] Saving test file: {rel_path}...")
+                    tool_map["write_file"].invoke({
+                        "path": str(safe_path),
+                        "content": f.content
+                    })
+                    print(f"📄 Saved test: {rel_path}")
+                    continue
+                except Exception as e:
+                    print(f"⚠️ [Filesystem MCP] Error writing test {rel_path}: {e}. Local fallback...")
+
+            try:
+                safe_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(safe_path, "w", encoding="utf-8") as out_f:
+                    out_f.write(f.content)
+                print(f"📄 Saved test (Local Fallback): {safe_path}")
             except Exception as e:
-                print(f"⚠️ [Filesystem MCP] Error writing test {rel_path}: {e}. Local fallback...")
-                
-        try:
-            fallback_full_path = os.path.join(test_dir, f.filename)
-            parent_dir = os.path.dirname(fallback_full_path)
-            os.makedirs(parent_dir, exist_ok=True)
-            with open(fallback_full_path, "w", encoding="utf-8") as out_f:
-                out_f.write(f.content)
-            print(f"📄 Saved test (Local Fallback): output/tests/{f.filename}")
-        except Exception as e:
-            print(f"❌ Error writing local test file: {e}")
+                print(f"❌ Error writing local test file: {e}")
+    finally:
+        if mcp_client:
+            mcp_client.close()
 
 
 def run_test_generator(
@@ -405,53 +446,69 @@ def run_test_generator(
     
     # Connect Playwright MCP
     playwright_client = ThreadSafeMCPClient("npx", ["-y", "@playwright/mcp@latest"])
-    tools = playwright_client.get_tools()
-    
-    llm = llm_qa
-
-    agent = create_react_agent(llm, tools=tools)
-    
-    stories_json = json.dumps(
-        [s.model_dump() for s in pm_output.user_stories],
-        indent=2,
-        ensure_ascii=False,
-    )
-    dev_summary = _summarize_dev_files(developer_output)
-    
-    prompt = (
-        f"{TEST_GENERATOR_SYSTEM_PROMPT}\n\n"
-        "Generate test cases and test code based on these user stories and Developer files. "
-        "If you need to validate or interact with a browser to generate/verify UI flows, use the Playwright tools:\n\n"
-        f"USER STORIES:\n{stories_json}\n\n"
-        f"DEVELOPER FILES:\n{dev_summary}"
-    )
-
-    print("🧪  QA Agent (Test Generator) consulting tools and generating tests...")
-    response = agent.invoke({"messages": [HumanMessage(content=prompt)]}, config={"recursion_limit": 10})
-    
-    final_message = response["messages"][-1].content
-    cleaned = clean_llm_response(final_message)
-    cleaned = _fix_json(cleaned)
-
     try:
-        data = json_repair.loads(cleaned)
-        test_cases = [TestCase.model_validate(tc) for tc in data["test_cases"]]
-        test_files = [TestFile.model_validate(tf) for tf in data["test_files"]]
-        return {"test_cases": test_cases, "test_files": test_files}
-    except Exception as exc:
-        print(f"   ⚠️ Test parsing failed: {exc}. Retrying with direct prompt...")
-        messages = [
-            SystemMessage(content=TEST_GENERATOR_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-            HumanMessage(content=RETRY_PROMPT.format(error=str(exc)))
-        ]
-        retry_res = llm.invoke(messages)
-        cleaned_retry = clean_llm_response(retry_res.content)
-        cleaned_retry = _fix_json(cleaned_retry)
-        data = json_repair.loads(cleaned_retry)
-        test_cases = [TestCase.model_validate(tc) for tc in data["test_cases"]]
-        test_files = [TestFile.model_validate(tf) for tf in data["test_files"]]
-        return {"test_cases": test_cases, "test_files": test_files}
+        tools = playwright_client.get_tools()
+
+        llm = llm_qa
+
+        agent = create_react_agent(llm, tools=tools)
+
+        stories_json = json.dumps(
+            [s.model_dump() for s in pm_output.user_stories],
+            indent=2,
+            ensure_ascii=False,
+        )
+        dev_summary = _summarize_dev_files(developer_output)
+
+        prompt = (
+            f"{TEST_GENERATOR_SYSTEM_PROMPT}\n\n"
+            "Generate test cases and test code based on these user stories and Developer files. "
+            "If you need to validate or interact with a browser to generate/verify UI flows, use the Playwright tools:\n\n"
+            f"USER STORIES:\n{stories_json}\n\n"
+            f"DEVELOPER FILES:\n{dev_summary}"
+        )
+
+        print("🧪  QA Agent (Test Generator) consulting tools and generating tests...")
+        response = agent.invoke(
+            {"messages": [HumanMessage(content=prompt)]},
+            config={"recursion_limit": 100},
+        )
+
+        # Guard: only parse JSON from an AI message, not a trailing tool message.
+        messages_list = response["messages"]
+        final_message = ""
+        for msg in reversed(messages_list):
+            if getattr(msg, "type", None) == "ai" and msg.content:
+                final_message = msg.content
+                break
+        if not final_message and messages_list:
+            last_msg = messages_list[-1]
+            if getattr(last_msg, "type", None) == "ai":
+                final_message = last_msg.content
+
+        try:
+            data = parse_llm_json(final_message)
+            test_cases = [TestCase.model_validate(tc) for tc in data.get("test_cases", [])]
+            test_files = [TestFile.model_validate(tf) for tf in data.get("test_files", [])]
+            return {"test_cases": test_cases, "test_files": test_files}
+        except Exception as exc:
+            print(f"   ⚠️ Test parsing failed: {exc}. Retrying with direct prompt...")
+            try:
+                messages = [
+                    SystemMessage(content=TEST_GENERATOR_SYSTEM_PROMPT),
+                    HumanMessage(content=prompt),
+                    HumanMessage(content=RETRY_PROMPT.format(error=str(exc)))
+                ]
+                retry_res = llm.invoke(messages)
+                data = parse_llm_json(retry_res.content)
+                test_cases = [TestCase.model_validate(tc) for tc in data.get("test_cases", [])]
+                test_files = [TestFile.model_validate(tf) for tf in data.get("test_files", [])]
+                return {"test_cases": test_cases, "test_files": test_files}
+            except Exception as retry_exc:
+                print(f"   ❌ Test retry parsing failed: {retry_exc}. Returning empty test set.")
+                return {"test_cases": [], "test_files": []}
+    finally:
+        playwright_client.close()
 
 
 def run_code_reviewer(developer_output: DeveloperOutput) -> dict:
@@ -472,9 +529,13 @@ def run_code_reviewer(developer_output: DeveloperOutput) -> dict:
     ]
 
     def parse_review_output(data: dict) -> dict:
-        code_issues = [CodeIssue.model_validate(ci) for ci in data["code_issues"]]
-        quality_score = max(0, min(100, int(data["quality_score"])))
-        quality_summary = str(data["quality_summary"])
+        code_issues = [CodeIssue.model_validate(ci) for ci in data.get("code_issues", [])]
+        # Coerce defensively: the LLM may emit a non-numeric value like "N/A".
+        try:
+            quality_score = max(0, min(100, int(data.get("quality_score", 0))))
+        except (ValueError, TypeError):
+            quality_score = 0
+        quality_summary = str(data.get("quality_summary", ""))
         return {
             "code_issues": code_issues,
             "quality_score": quality_score,

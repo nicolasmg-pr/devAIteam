@@ -55,8 +55,11 @@ def context7_node(state: ArchitectState) -> dict:
         return {"architect_output": refined_output}
     except Exception as exc:
         print(f"⚠️ [Context7 Node] Enrichment with Context7 failed: {exc}")
-        state.architect_output.context7_enriched = False
-        return {"architect_output": state.architect_output}
+        # Build a copy instead of mutating the input state in place.
+        refined_output = state.architect_output.model_copy(
+            update={"context7_enriched": False}
+        )
+        return {"architect_output": refined_output}
 
 
 def format_node(state: ArchitectState) -> dict:

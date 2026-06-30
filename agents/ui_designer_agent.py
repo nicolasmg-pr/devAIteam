@@ -1,7 +1,7 @@
 from typing import List
 from pydantic import BaseModel, Field
 from config.llm_config import llm_designer
-from tools.llm_helpers import clean_llm_response
+from tools.llm_helpers import parse_llm_json
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.prebuilt import create_react_agent
 
@@ -59,7 +59,7 @@ def _extract_nested_json(data: Any) -> Any:
         data_stripped = data.strip()
         if data_stripped.startswith("{") or data_stripped.startswith("["):
             try:
-                data = json_repair.loads(clean_llm_response(data_stripped))
+                data = parse_llm_json(data_stripped)
             except Exception:
                 pass
 
@@ -71,8 +71,7 @@ def _extract_nested_json(data: Any) -> Any:
             if isinstance(first_block, dict) and "text" in first_block:
                 text_content = first_block["text"]
                 try:
-                    inner_cleaned = clean_llm_response(text_content)
-                    inner_data = json_repair.loads(inner_cleaned)
+                    inner_data = parse_llm_json(text_content)
                     return _extract_nested_json(inner_data)
                 except Exception:
                     pass
@@ -159,42 +158,47 @@ def run_ui_designer_agent(architect_output: ArchitectOutput, stitch_api_key: str
     # Initialize Stitch MCP Tools
     stitch_client = StitchMCPClient(api_key=stitch_api_key)
     try:
-        tools = stitch_client.get_tools()
-        print(f"🔧 [UIDesigner] Loaded {len(tools)} Google Stitch tools.")
-    except Exception as e:
-        print(f"⚠️ [UIDesigner] Error loading Stitch tools: {e}. Running without tools.")
-        tools = []
-        
-    llm = llm_designer
-    
-    agent = create_react_agent(llm, tools=tools)
-    
-    arch_json = architect_output.model_dump_json(indent=2)
-    
-    # Combine the system prompt with the human message as the first prompt
-    prompt = f"{UIDESIGNER_SYSTEM_PROMPT}\n\nHere is the system architecture:\n{arch_json}\n\nUse Stitch tools to generate the screens, and then return the structured JSON."
-    
-    print("🎨 [UIDesigner] Generating screens with Google Stitch...")
-    response = agent.invoke({"messages": [HumanMessage(content=prompt)]}, config={"recursion_limit": 100})
-    
-    # Search backwards for the last AIMessage to get the LLM's final structured text
-    final_message = ""
-    messages_list = response.get("messages", []) if isinstance(response, dict) else getattr(response, "messages", [])
-    
-    for msg in reversed(messages_list):
-        if getattr(msg, "type", None) == "ai" and msg.content:
-            final_message = msg.content
-            break
-            
-    if not final_message and messages_list:
-        final_message = messages_list[-1].content
-    
+        try:
+            tools = stitch_client.get_tools()
+            print(f"🔧 [UIDesigner] Loaded {len(tools)} Google Stitch tools.")
+        except Exception as e:
+            print(f"⚠️ [UIDesigner] Error loading Stitch tools: {e}. Running without tools.")
+            tools = []
+
+        llm = llm_designer
+
+        agent = create_react_agent(llm, tools=tools)
+
+        arch_json = architect_output.model_dump_json(indent=2)
+
+        # Combine the system prompt with the human message as the first prompt
+        prompt = f"{UIDESIGNER_SYSTEM_PROMPT}\n\nHere is the system architecture:\n{arch_json}\n\nUse Stitch tools to generate the screens, and then return the structured JSON."
+
+        print("🎨 [UIDesigner] Generating screens with Google Stitch...")
+        response = agent.invoke({"messages": [HumanMessage(content=prompt)]}, config={"recursion_limit": 100})
+
+        # Search backwards for the last AIMessage to get the LLM's final structured text
+        final_message = ""
+        messages_list = response.get("messages", []) if isinstance(response, dict) else getattr(response, "messages", [])
+
+        for msg in reversed(messages_list):
+            if getattr(msg, "type", None) == "ai" and msg.content:
+                final_message = msg.content
+                break
+
+        if not final_message and messages_list:
+            # Guard: only treat the last message as JSON if it is an AI message,
+            # not a tool result message.
+            last_msg = messages_list[-1]
+            if getattr(last_msg, "type", None) == "ai":
+                final_message = last_msg.content
+    finally:
+        stitch_client.close()
+
     # Parse the final JSON from the agent's last message
     parsed_output = None
     try:
-        json_str = clean_llm_response(final_message)
-        raw_data = json_repair.loads(json_str)
-        data = _extract_nested_json(raw_data)
+        data = _extract_nested_json(parse_llm_json(final_message))
         if isinstance(data, dict):
             parsed_output = UIDesignerOutput.model_validate(data)
         else:

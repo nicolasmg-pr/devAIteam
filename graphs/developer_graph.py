@@ -9,10 +9,15 @@ concurrently, and they fan-in at the merge_node.
 from __future__ import annotations
 
 import traceback
-from typing import Optional
+from typing import Optional, Annotated
 
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
+
+
+def _keep_first(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """Reducer: keep the first non-None error from concurrent fan-out branches."""
+    return a or b
 
 from agents.architect_agent import ArchitectOutput, _run_async_in_thread
 from agents.developer_agent import (
@@ -44,7 +49,9 @@ class DeveloperState(BaseModel):
     developer_output: Optional[DeveloperOutput] = Field(
         default=None, description="Combined developer output"
     )
-    error: Optional[str] = Field(default=None, description="Error message if any")
+    error: Annotated[Optional[str], _keep_first] = Field(
+        default=None, description="Error message if any"
+    )
 
 
 # ── Nodes ────────────────────────────────────────────────────────────────────

@@ -159,21 +159,32 @@ class StitchMCPClient:
         }
         self.client = httpx.Client(timeout=300.0)
 
+    def close(self) -> None:
+        """Close the underlying HTTP client."""
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
     def _rpc_call(self, method: str, params: dict) -> dict:
-        """Send a JSON-RPC request to the MCP endpoint."""
+        """Send a JSON-RPC request to the MCP endpoint.
+
+        Never log the api_key, headers, full params, or full response bodies, as
+        they may contain secrets or large/sensitive payloads.
+        """
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
             "params": params,
         }
-        print(f"DEBUG RPC Call: {method} with params {params}")
         response = self.client.post(self.endpoint, headers=self.headers, json=payload)
-        print(f"DEBUG RPC Response Status: {response.status_code}")
-        try:
-            print(f"DEBUG RPC Response Content: {response.text[:200]}")
-        except Exception:
-            pass
         response.raise_for_status()
         data = response.json()
         if "error" in data:

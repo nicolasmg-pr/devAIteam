@@ -5,20 +5,28 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "aiofiles>=25.1.0",
-    "aiohttp>=3.13.5",
-    "json-repair>=0.59.10",
-    "langchain-core>=1.4.0",
-    "langchain-mcp-adapters>=0.2.2",
-    "langchain-ollama>=1.1.0",
-    "langchain-openai>=1.2.1",
-    "langgraph>=1.2.0",
-    "mcp>=1.27.1",
-    "python-dotenv>=1.2.2",
+    "aiofiles>=25.1.0,<26.0.0",
+    "aiohttp>=3.13.5,<4.0.0",
+    "json-repair>=0.59.10,<1.0.0",
+    "langchain-core>=1.4.0,<2.0.0",
+    "langchain-mcp-adapters>=0.2.2,<1.0.0",
+    "langchain-ollama>=1.1.0,<2.0.0",
+    "langchain-openai>=1.2.1,<2.0.0",
+    "langgraph>=1.2.0,<2.0.0",
+    "mcp>=1.27.1,<2.0.0",
+    "python-dotenv>=1.2.2,<2.0.0",
 ]
 
 [project.scripts]
 devAIteam = "main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0,<9.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.setuptools]
 py-modules = ["main"]

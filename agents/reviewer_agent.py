@@ -188,6 +188,62 @@ def _invoke_with_retry(
     raise last_error  # type: ignore[misc]
 
 
+def _coerce_to_obj(result: Any) -> Any:
+    """Best-effort coercion of an MCP tool result (often a string or JSON-RPC
+    content envelope) into a Python dict/list for structured extraction."""
+    if isinstance(result, (dict, list)):
+        return result
+    if isinstance(result, str):
+        try:
+            return _parse_json_robust(clean_llm_response(result))
+        except Exception:
+            return result
+    return result
+
+
+def _extract_sha(result: Any) -> Optional[str]:
+    """Pull a file blob ``sha`` out of a get-file-contents MCP tool result."""
+    obj = _coerce_to_obj(result)
+    if isinstance(obj, dict):
+        if isinstance(obj.get("sha"), str):
+            return obj["sha"]
+        # Some servers nest the file under "content" or "result".
+        for key in ("content", "result", "data"):
+            nested = obj.get(key)
+            if isinstance(nested, dict) and isinstance(nested.get("sha"), str):
+                return nested["sha"]
+    return None
+
+
+def _parse_pr_result(result: Any) -> tuple[Optional[str], Optional[int]]:
+    """Parse the PR URL and number from a create_pull_request MCP tool result.
+
+    Prefers structured fields (html_url / number); falls back to a regex over the
+    serialized result so we never invent a bogus ``/pull/new`` link.
+    """
+    obj = _coerce_to_obj(result)
+    url: Optional[str] = None
+    number: Optional[int] = None
+    if isinstance(obj, dict):
+        for key in ("html_url", "url", "pr_url"):
+            if isinstance(obj.get(key), str) and "/pull/" in obj[key]:
+                url = obj[key]
+                break
+        if isinstance(obj.get("number"), int):
+            number = obj["number"]
+
+    text = str(result)
+    if url is None:
+        m = re.search(r'(https://github\.com/[^\s"\']+/pull/\d+)', text)
+        if m:
+            url = m.group(1)
+    if number is None and url:
+        m = re.search(r'/pull/(\d+)', url)
+        if m:
+            number = int(m.group(1))
+    return url, number
+
+
 def _summarize_dev_files(dev_output: DeveloperOutput, max_chars: int = 800) -> str:
     summary = []
     for f in dev_output.backend.files + dev_output.frontend.files:
@@ -260,106 +316,154 @@ QA AGENT ISSUES (ALREADY DETECTED, DO NOT REPEAT):
 async def create_github_pr(reviewer_output: ReviewerOutput, developer_output: DeveloperOutput) -> dict:
     """Connect to GitHub MCP, create a branch, push review refinements, and open a Pull Request."""
     from agents.mcp_client import get_mcp_tools, GITHUB_MCP_CONFIG
+    import asyncio
     import os
     import time
-    import re as std_re
-    
-    # 1. Connect to GitHub MCP
-    tools = get_mcp_tools(GITHUB_MCP_CONFIG, "stdio")
-    tool_map = {t.name: t for t in tools} if tools else {}
-    
-    owner = os.getenv("GITHUB_OWNER", "nikomendez")
+
+    owner = os.getenv("GITHUB_OWNER")
     repo = os.getenv("GITHUB_OUTPUT_REPO") or os.getenv("GITHUB_PROJECT_REPO")
     if not repo:
         proj_clean = developer_output.project_name.lower().replace(" ", "-").replace("_", "-")
         print("⚠️  [GitHub] GITHUB_OUTPUT_REPO is not set in your .env file.")
         print(f"   -> Defaulting dynamically to repository name: '{proj_clean}'. Make sure you have created this repository on GitHub!")
         repo = proj_clean
-    
+
+    # Abort gracefully if we don't know who owns the target repo.
+    if not owner:
+        print("⚠️  [GitHub] GITHUB_OWNER is not set; cannot determine target repository owner.")
+        return {
+            "status": "aborted",
+            "pr_url": None,
+            "branch": None,
+            "reason": "GITHUB_OWNER environment variable is not set.",
+        }
+
+    def _normalize(path: str) -> str:
+        return os.path.normpath((path or "").strip().lstrip("/"))
+
+    def _resolve_file_content(change) -> str:
+        """Resolve the full updated content for a change by matching the dev file
+        on full normalized path equality (path/filename), not substring."""
+        target = _normalize(change.file)
+        matched_content = None
+        for dev_file in developer_output.backend.files + developer_output.frontend.files:
+            dev_full = _normalize(os.path.join(dev_file.path, dev_file.filename))
+            if dev_full == target:
+                matched_content = dev_file.content
+                break
+
+        if matched_content is not None:
+            if change.original_snippet and change.proposed_snippet:
+                return matched_content.replace(change.original_snippet, change.proposed_snippet)
+            return matched_content
+        # No matching dev file: fall back to the proposed snippet as the new content.
+        return change.proposed_snippet or ""
+
+    # 1. Connect to GitHub MCP
+    tools, mcp_client = get_mcp_tools(GITHUB_MCP_CONFIG, "stdio", return_client=True)
+    tool_map = {t.name: t for t in tools} if tools else {}
+
     # Check if tools are present and valid
     github_available = all(k in tool_map for k in ["create_branch", "create_or_update_file", "create_pull_request"])
-    
+    get_file_tool = next(
+        (tool_map[k] for k in ("get_file_contents", "get_file", "get_contents") if k in tool_map),
+        None,
+    )
+
     branch_name = f"review-refinements-{int(time.time())}"
-    
-    if github_available:
-        try:
-            print(f"🐙 [GitHub MCP] Starting creation of branch '{branch_name}' in {owner}/{repo}...")
-            create_branch_res = tool_map["create_branch"].invoke({
-                "owner": owner,
-                "repo": repo,
-                "branch": branch_name,
-                "base_branch": "main"
-            })
-            print(f"✅ Branch '{branch_name}' created: {create_branch_res}")
-            
-            # Push changed files
-            for change in reviewer_output.approved_changes:
-                file_content = ""
-                for dev_file in developer_output.backend.files + developer_output.frontend.files:
-                    if dev_file.filename == os.path.basename(change.file) or dev_file.path in change.file:
-                        file_content = dev_file.content
-                        break
-                        
-                if change.original_snippet and change.proposed_snippet and file_content:
-                    file_content = file_content.replace(change.original_snippet, change.proposed_snippet)
-                elif change.proposed_snippet:
-                    file_content = change.proposed_snippet
-                    
-                if not file_content:
-                    file_content = change.proposed_snippet
-                    
-                print(f"🚀 [GitHub MCP] Updating file {change.file} on branch {branch_name}...")
-                tool_map["create_or_update_file"].invoke({
+
+    try:
+        if github_available:
+            try:
+                print(f"🐙 [GitHub MCP] Starting creation of branch '{branch_name}' in {owner}/{repo}...")
+                create_branch_res = await asyncio.to_thread(tool_map["create_branch"].invoke, {
                     "owner": owner,
                     "repo": repo,
-                    "path": change.file,
-                    "message": f"Apply review refinements for {change.file}: {change.reason}",
-                    "content": file_content,
-                    "branch": branch_name
+                    "branch": branch_name,
+                    "base_branch": "main"
                 })
-                
-            # Create Pull Request
-            pr_body = (
-                f"# Review Refinements - AI Dev Team\n\n"
-                f"This Pull Request contains automatic changes proposed by the Code Reviewer Agent "
-                f"and approved by the human in the final round.\n\n"
-                f"## Summary of changes:\n"
-            )
-            for c in reviewer_output.approved_changes:
-                pr_body += f"- **{c.file}**: {c.reason} ({c.change_type})\n"
-                
-            print(f"🐙 [GitHub MCP] Opening Pull Request for branch '{branch_name}'...")
-            pr_res = tool_map["create_pull_request"].invoke({
-                "owner": owner,
-                "repo": repo,
-                "title": f"Review Refinements - AI Dev Team ({branch_name})",
-                "body": pr_body,
-                "head": branch_name,
-                "base": "main"
-            })
-            
-            pr_url = f"https://github.com/{owner}/{repo}/pull/new/{branch_name}"
-            match = std_re.search(r'(https://github\.com/[^\s"]+/pull/\d+)', str(pr_res))
-            if match:
-                pr_url = match.group(1)
-                
-            print(f"✅ Pull Request successfully created: {pr_url}")
-            return {
-                "status": "success",
-                "pr_url": pr_url,
-                "branch": branch_name,
-                "info": str(pr_res)
-            }
-            
-        except Exception as e:
-            print(f"⚠️ [GitHub MCP] GitHub flow failed: {e}. Using simulated fallback...")
-            
-    # Fallback / Simulated
-    print("⚠️ [GitHub PR] GitHub MCP not available or connection failed. Simulating PR creation locally.")
-    simulated_pr_url = f"https://github.com/{owner}/{repo}/pull/simulated_{branch_name}"
-    return {
-        "status": "simulated",
-        "pr_url": simulated_pr_url,
-        "branch": branch_name,
-        "reason": "GitHub MCP not available or without credentials, PR was simulated locally."
-    }
+                print(f"✅ Branch '{branch_name}' created: {create_branch_res}")
+
+                # Push changed files
+                for change in reviewer_output.approved_changes:
+                    file_content = _resolve_file_content(change)
+                    if not file_content:
+                        print(f"⚠️ [GitHub MCP] No content resolved for {change.file}; skipping.")
+                        continue
+
+                    update_args = {
+                        "owner": owner,
+                        "repo": repo,
+                        "path": change.file,
+                        "message": f"Apply review refinements for {change.file}: {change.reason}",
+                        "content": file_content,
+                        "branch": branch_name
+                    }
+
+                    # If the file already exists, GitHub requires its blob sha to update it.
+                    if get_file_tool is not None:
+                        try:
+                            existing = await asyncio.to_thread(get_file_tool.invoke, {
+                                "owner": owner,
+                                "repo": repo,
+                                "path": change.file,
+                                "ref": branch_name,
+                            })
+                            sha = _extract_sha(existing)
+                            if sha:
+                                update_args["sha"] = sha
+                        except Exception as sha_err:
+                            print(f"   ℹ️ [GitHub MCP] Could not fetch existing sha for {change.file} (treating as new): {sha_err}")
+
+                    print(f"🚀 [GitHub MCP] Updating file {change.file} on branch {branch_name}...")
+                    await asyncio.to_thread(tool_map["create_or_update_file"].invoke, update_args)
+
+                # Create Pull Request
+                pr_body = (
+                    f"# Review Refinements - AI Dev Team\n\n"
+                    f"This Pull Request contains automatic changes proposed by the Code Reviewer Agent "
+                    f"and approved by the human in the final round.\n\n"
+                    f"## Summary of changes:\n"
+                )
+                for c in reviewer_output.approved_changes:
+                    pr_body += f"- **{c.file}**: {c.reason} ({c.change_type})\n"
+
+                print(f"🐙 [GitHub MCP] Opening Pull Request for branch '{branch_name}'...")
+                pr_res = await asyncio.to_thread(tool_map["create_pull_request"].invoke, {
+                    "owner": owner,
+                    "repo": repo,
+                    "title": f"Review Refinements - AI Dev Team ({branch_name})",
+                    "body": pr_body,
+                    "head": branch_name,
+                    "base": "main"
+                })
+
+                pr_url, pr_number = _parse_pr_result(pr_res)
+                if not pr_url:
+                    # Fall back to the compare view rather than a misleading /pull/new link.
+                    pr_url = f"https://github.com/{owner}/{repo}/compare/main...{branch_name}"
+
+                print(f"✅ Pull Request successfully created: {pr_url}")
+                return {
+                    "status": "success",
+                    "pr_url": pr_url,
+                    "pr_number": pr_number,
+                    "branch": branch_name,
+                    "info": str(pr_res)
+                }
+
+            except Exception as e:
+                print(f"⚠️ [GitHub MCP] GitHub flow failed: {e}. Using simulated fallback...")
+
+        # Fallback / Simulated
+        print("⚠️ [GitHub PR] GitHub MCP not available or connection failed. Simulating PR creation locally.")
+        simulated_pr_url = f"https://github.com/{owner}/{repo}/compare/main...{branch_name}"
+        return {
+            "status": "simulated",
+            "pr_url": simulated_pr_url,
+            "branch": branch_name,
+            "reason": "GitHub MCP not available or without credentials, PR was simulated locally."
+        }
+    finally:
+        if mcp_client:
+            mcp_client.close()
